@@ -77,6 +77,8 @@ compass::LevelCalibration g_level;
 float g_calibrationCoverage = 0.0F;
 // キャリブレーション開始時の姿勢。ここから外れたサンプルは採らない。
 float g_referenceTilt = 0.0F;
+// タッチ入力を受けた回数。実機でスワイプが検出されているかを見る。
+int g_touchEventCount = 0;
 // 直近の tick で サーボが静止していたか。診断用。
 bool g_lastTickServoSettled = false;
 compass::MeasurementGate g_gate;
@@ -381,12 +383,15 @@ void applyServoIntent(const app::ServoIntent& intent, int actualYaw) {
 
 app::Input readInput() {
   if (M5StackChan.TouchSensor.wasSwipedForward()) {
+    ++g_touchEventCount;
     return app::Input::SwipeForward;
   }
   if (M5StackChan.TouchSensor.wasSwipedBackward()) {
+    ++g_touchEventCount;
     return app::Input::SwipeBackward;
   }
   if (M5StackChan.TouchSensor.wasClicked()) {
+    ++g_touchEventCount;
     return app::Input::Click;
   }
   return app::Input::None;
@@ -722,6 +727,8 @@ void loop() {
       // 時刻が入っているかと、いま指しているターゲット。
       probe.putInt("timeOk", g_timeValid ? 1 : 0);
       probe.putInt("target", static_cast<int>(g_state.target));
+      // タッチ入力が届いているか。スワイプが効かないときの切り分け用。
+      probe.putInt("touchN", g_touchEventCount);
       probe.putInt("lvCov", static_cast<int>(std::lround(g_calibrationCoverage * 100.0F)));
       // 傾き判定に使っている値。閾値が実機に対して妥当かを見る。
       const compass::Vec3 accelProbe = readAccel();

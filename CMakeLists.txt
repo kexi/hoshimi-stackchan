@@ -79,6 +79,13 @@ if(BUILD_TESTING)
   target_compile_options(sphere-fit-test PRIVATE ${COMPASS_WARNINGS})
   add_test(NAME sphere-fit-test COMMAND sphere-fit-test)
 
+  # スワイプで天体が切り替わり、首がその天体を指すことを通しで検証する
+  add_executable(target-switch-test test/target_switch_test.cpp)
+  target_link_libraries(target-switch-test PRIVATE app_core)
+  target_include_directories(target-switch-test PRIVATE test)
+  target_compile_options(target-switch-test PRIVATE ${COMPASS_WARNINGS})
+  add_test(NAME target-switch-test COMMAND target-switch-test)
+
   add_executable(app-test test/app_test.cpp)
   target_link_libraries(app-test PRIVATE app_core)
   target_include_directories(app-test PRIVATE test)
