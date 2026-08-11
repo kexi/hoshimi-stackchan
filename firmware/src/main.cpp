@@ -14,6 +14,7 @@
 // 30 秒間隔で残す。毎周期フラッシュへ書き、そこで球の当てはめまで回していた頃は、
 // それ自体がウォッチドッグを踏んで数秒ごとに再起動していた。
 
+#include <Avatar.h>
 #include <M5StackChan.h>
 #include <M5Unified.h>
 #include <Preferences.h>
@@ -94,7 +95,21 @@ int g_touchSeenCount = 0;
 // 直近の tick で サーボが静止していたか。診断用。
 bool g_lastTickServoSettled = false;
 compass::MeasurementGate g_gate;
-compass::HeadingFilter g_headingFilter{0.5F};
+// 平滑化を強めにする。
+//
+// 0.5 だと実機で方位が 12 度揺れ、それが首の指令にそのまま出て小刻みに
+// 動き続けた。首を正面に戻さず測るようになった分、値のばらつきが増えている。
+compass::HeadingFilter g_headingFilter{0.15F};
+// 首の角度による方位のずれ (実測で最大 119 度) を角度ごとに覚える表。
+//
+// これがあると、首を正面に戻さなくても方位が読める。持ち歩きながら天体を
+// 指し続けるには、指した姿勢のまま方位を追える必要がある。
+compass::ServoBiasTable g_biasTable;
+// 正面で採った方位。バイアス表を学習するときの真値として使う。
+float g_measurePoseHeading = 0.0F;
+bool g_hasMeasurePoseHeading = false;
+// 表を書き換えたが、まだ NVS に落としていない。
+bool g_biasDirty = false;
 
 compass::Vec3* g_calibrationSamples = nullptr;
 std::size_t g_calibrationCount = 0;
@@ -178,6 +193,29 @@ void saveLevel(const compass::LevelCalibration& calibration) {
     return;
   }
   preferences.putBytes("cal", &calibration, sizeof(calibration));
+  preferences.end();
+}
+
+// 首の角度によるずれの表。学習に時間がかかるので、電源を切っても残す。
+void saveBiasTable() {
+  Preferences preferences;
+  if (!preferences.begin("bias", false)) {
+    return;
+  }
+  preferences.putBytes("table", &g_biasTable, sizeof(g_biasTable));
+  preferences.end();
+}
+
+void loadBiasTable() {
+  Preferences preferences;
+  if (!preferences.begin("bias", true)) {
+    return;
+  }
+  compass::ServoBiasTable stored;
+  if (preferences.getBytesLength("table") == sizeof(stored)) {
+    preferences.getBytes("table", &stored, sizeof(stored));
+    g_biasTable = stored;
+  }
   preferences.end();
 }
 
@@ -461,9 +499,8 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
     return;
   }
 
-  const bool poseIsClean =
-      compass::isMeasurementPose(yawDeci) && !servoLikelyMoving(nowMillis, yawDeci);
-  if (!poseIsClean) {
+  // サーボが動いている最中の値は使えない。磁場が揺れている。
+  if (servoLikelyMoving(nowMillis, yawDeci)) {
     return;
   }
 
@@ -471,8 +508,43 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
   const compass::Vec3 corrected = g_ellipsoid.valid ? compass::applyEllipsoid(g_ellipsoid, raw)
                                                     : compass::applyCalibration(g_calibration, raw);
   const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
-  g_headingFilter.update(compass::tiltCompensatedHeadingDegrees(corrected, attitude));
-  g_gate.learnReferenceField(compass::magnitude(raw));
+  const float measured = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
+
+  const bool atMeasurePose = compass::isMeasurementPose(yawDeci);
+
+  // 首が正面なら、その値がそのまま機体の方位。バイアス表の基準にもなる。
+  if (atMeasurePose) {
+    g_headingFilter.update(measured);
+    g_gate.learnReferenceField(compass::magnitude(raw));
+    if (g_headingFilter.hasConverged(8)) {
+      g_measurePoseHeading = g_headingFilter.valueDegrees();
+      g_hasMeasurePoseHeading = true;
+    }
+    return;
+  }
+
+  // 首が横を向いている。バイアス表があれば補正して使う。持ち歩きながら
+  // 指し続けるには、指した姿勢のままでも方位を追い続ける必要がある。
+  if (g_biasTable.isPopulated()) {
+    const float correction = g_biasTable.correctionDegrees(yawDeci);
+    g_headingFilter.update(compass::normalizeDegrees(measured - correction));
+    return;
+  }
+
+  // 表がまだ無いので学習する。正面で採った方位を真値とみなし、ここでの
+  // ずれを角度ごとに覚える。機体が動いていないことが前提なので、
+  // ジャイロが静かなときだけ採る。
+  if (!g_hasMeasurePoseHeading) {
+    return;
+  }
+  const bool bodyStill = readGyroMagnitude() < g_config.bodyMovedGyroDegPerSec;
+  if (!bodyStill) {
+    return;
+  }
+  g_biasTable.observe(yawDeci, compass::signedAngleDifference(measured, g_measurePoseHeading));
+  // 保存は学習が終わってから 1 回だけ。ここで書くと、ビンが埋まる周期と
+  // NVS の書き込みが重なってウォッチドッグを踏む。
+  g_biasDirty = true;
 }
 
 // キャリブレーションの完了判定。当てはめが重いので間隔を空けて呼ぶこと。
@@ -495,134 +567,135 @@ void tryFinishCalibration() {
   g_headingFilter.reset();
 }
 
-// 直近の当てはめ結果。描画から使う。
-// 描画のたびに当てはめを回すとウォッチドッグを踏むので、
-// tryFinishCalibration() が更新した値を読むだけにする。
-void drawCalibrating() {
-  auto& display = M5.Display;
-  display.setTextColor(TFT_YELLOW, TFT_BLACK);
-  display.setCursor(4, 40);
-  display.print("spin in place ");
-  display.setCursor(4, 76);
-  display.printf("%d%%      ", static_cast<int>(g_calibrationCoverage * 100.0F));
+m5avatar::Avatar g_avatar;
 
-  // 姿勢が変わると採れないので、その場で伝える。
-  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  display.setCursor(4, 112);
-  display.printf("n=%d      ", static_cast<int>(g_calibrationCount));
-}
-
-// ターゲットごとの色。切り替わったことが一目で分かるようにする。
-std::uint16_t targetColor(astro::Target target) {
+// 天体の日本語名。画面に出すのはこちらを使う。
+// astro::targetName() は英語のまま残す (シリアルログと verify が読む)。
+const char* targetNameJa(astro::Target target) {
   switch (target) {
   case astro::Target::North:
-    return TFT_WHITE;
+    return "北";
   case astro::Target::Sun:
-    return TFT_ORANGE;
+    return "太陽";
   case astro::Target::Moon:
-    return TFT_SILVER;
+    return "月";
   case astro::Target::Mercury:
-    return TFT_DARKGREY;
+    return "水星";
   case astro::Target::Venus:
-    return TFT_YELLOW;
+    return "金星";
   case astro::Target::Mars:
-    return TFT_RED;
+    return "火星";
   case astro::Target::Jupiter:
-    return TFT_ORANGE;
+    return "木星";
   case astro::Target::Saturn:
-    return TFT_GOLD;
+    return "土星";
   case astro::Target::kCount:
     break;
   }
-  return TFT_WHITE;
+  return "?";
 }
 
-// 方位を 16 方位の記号にする。数値より向きが掴みやすい。
-const char* compassPoint(double azimuthDegrees) {
-  static const char* kPoints[] = {"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-                                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
-  auto index = static_cast<int>(std::lround(azimuthDegrees / 22.5)) % 16;
-  if (index < 0) {
-    index += 16;
+// 指せているときのセリフ。天体ごとに変える。
+//
+// ここが「方角を教える道具」と「スタックチャン」の分かれ目なので、
+// 数値だけでなく、その天体らしい一言を添える。
+//
+// 吹き出しは幅が文字数で決まり、画面 (320px) からはみ出すと切れる。
+// 文字は 16px フォント x TEXT_SIZE 2 = 実質 32px 相当なので、
+// 全角 7 文字あたりが上限。
+const char* pointingSpeech(astro::Target target) {
+  switch (target) {
+  case astro::Target::North:
+    return "きたはこっち";
+  case astro::Target::Sun:
+    return "おひさま！";
+  case astro::Target::Moon:
+    return "月が綺麗だね";
+  case astro::Target::Mercury:
+    return "水星いるよ";
+  case astro::Target::Venus:
+    return "金星ピカピカ";
+  case astro::Target::Mars:
+    return "火星は赤いよ";
+  case astro::Target::Jupiter:
+    return "木星おおきい";
+  case astro::Target::Saturn:
+    return "土星のわっか";
+  case astro::Target::kCount:
+    break;
   }
-  return kPoints[index];
+  return "あっちだよ";
 }
 
-void drawStatus() {
-  auto& display = M5.Display;
-
-  // ターゲットが変わったら画面を消す。文字サイズが混在するので、
-  // 上書きだけだと前の文字が残る。
-  static astro::Target lastTarget = astro::Target::kCount;
-  static bool lastWasCalibrating = true;
-  const bool isCalibrating = g_state.phase == app::Phase::Calibrating;
-  if (g_state.target != lastTarget || isCalibrating != lastWasCalibrating) {
-    display.fillScreen(TFT_BLACK);
-    lastTarget = g_state.target;
-    lastWasCalibrating = isCalibrating;
+// 地平線の下にいるときのセリフ。方位は正しいが、見えない。
+const char* belowHorizonSpeech(astro::Target target) {
+  if (target == astro::Target::Sun) {
+    return "地球の裏だよ";
   }
-
-  if (isCalibrating) {
-    display.setTextSize(2);
-    display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.setCursor(4, 4);
-    display.print("compass       ");
-    drawCalibrating();
-    return;
+  if (target == astro::Target::Moon) {
+    return "おやすみ中";
   }
+  return "地平線の下";
+}
 
-  // ターゲット名を大きく出す。スワイプで切り替わるのが主役なので。
-  display.setTextSize(3);
-  display.setTextColor(targetColor(g_state.target), TFT_BLACK);
-  display.setCursor(4, 4);
-  display.printf("%-8s ", astro::targetName(g_state.target));
+// 状態を顔に反映する。
+//
+// 描画そのものは Avatar が自前のスレッドで回すので、ここでは表情・視線・
+// 吹き出しを設定するだけにする。M5.Display へ直接書くと Avatar の描画と
+// 取り合いになって画面が壊れる。
+void updateFace() {
+  // 吹き出しは毎周期渡すとちらつくので、変わったときだけ差し替える。
+  static char lastSpeech[64] = {};
+  char speech[64] = {};
 
-  display.setTextSize(2);
-
-  if (!g_state.lastPosition.valid) {
-    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    display.setCursor(4, 44);
-    display.print("no time sync   ");
-    display.setCursor(4, 70);
-    display.print("set wifi_config");
-    return;
-  }
-
-  const auto& horizontal = g_state.lastPosition.horizontal;
-  display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.setCursor(4, 44);
-  display.printf("%-3s %5.1f    ", compassPoint(horizontal.azimuthDegrees),
-                 horizontal.azimuthDegrees);
-  display.setCursor(4, 70);
-  display.printf("alt %+5.1f     ", horizontal.altitudeDegrees);
-
-  // 指せているかを伝える。黙って端に張り付くと指していると誤解される。
-  display.setCursor(4, 104);
-  if (g_state.lastSolve.command.clampedPitch) {
-    display.setTextColor(TFT_ORANGE, TFT_BLACK);
-    display.printf("%+.0f deg higher ", g_state.lastSolve.unreachablePitchDegrees);
+  if (g_state.phase == app::Phase::Calibrating) {
+    g_avatar.setExpression(m5avatar::Expression::Doubt);
+    std::snprintf(speech, sizeof(speech), "回して %d%%",
+                  static_cast<int>(g_calibrationCoverage * 100.0F));
+  } else if (!g_state.lastPosition.valid) {
+    g_avatar.setExpression(m5avatar::Expression::Sleepy);
+    std::snprintf(speech, sizeof(speech), "時計がないの");
+  } else if (g_state.phase == app::Phase::LearningBias) {
+    // 首を振ってクセを覚えている最中。動かさないでほしい。
+    g_avatar.setExpression(m5avatar::Expression::Neutral);
+    std::snprintf(speech, sizeof(speech), "おぼえ中 %u/8",
+                  static_cast<unsigned>(g_biasTable.populatedBinCount()));
   } else if (g_state.lastSolve.command.clampedYaw) {
-    display.setTextColor(TFT_ORANGE, TFT_BLACK);
-    display.print("turn me around ");
+    // 首が届いていない。困った顔で、指せない方向へ目だけ向ける。
+    g_avatar.setExpression(m5avatar::Expression::Doubt);
+    std::snprintf(speech, sizeof(speech), "%sはうしろ", targetNameJa(g_state.target));
+  } else if (g_state.lastSolve.command.clampedPitch) {
+    g_avatar.setExpression(m5avatar::Expression::Doubt);
+    std::snprintf(speech, sizeof(speech), "%sはもっと上", targetNameJa(g_state.target));
   } else if (!g_state.lastPosition.aboveHorizon) {
-    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    display.print("below horizon  ");
+    // 地平線の下。方位は正しいが見えないので、眠そうにしておく。
+    g_avatar.setExpression(m5avatar::Expression::Sleepy);
+    std::snprintf(speech, sizeof(speech), "%s", belowHorizonSpeech(g_state.target));
   } else {
-    display.setTextColor(TFT_GREEN, TFT_BLACK);
-    display.print("pointing       ");
+    g_avatar.setExpression(m5avatar::Expression::Happy);
+    std::snprintf(speech, sizeof(speech), "%s", pointingSpeech(g_state.target));
   }
 
-  // 下段は状態。方位が無効なら赤で示す。
-  display.setTextSize(1);
-  display.setTextColor(g_headingValid ? TFT_DARKGREY : TFT_RED, TFT_BLACK);
-  display.setCursor(4, 138);
-  display.printf("hdg %5.1f  %-13s %s    ", g_bodyTrueHeading, app::phaseName(g_state.phase),
-                 g_state.autoCycleEnabled ? "AUTO" : "");
+  if (std::strcmp(speech, lastSpeech) != 0) {
+    std::strncpy(lastSpeech, speech, sizeof(lastSpeech) - 1);
+    g_avatar.setSpeechText(speech);
+  }
 
-  // 操作の案内。触れば分かるが、最初の一回のために出しておく。
-  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  display.setCursor(4, 152);
-  display.print("swipe: target   tap: auto");
+  // 指せていない分だけ視線を寄せる。首が届かないことが表情で分かる。
+  float horizontalGaze = 0.0F;
+  if (g_state.hasSolve && g_state.lastSolve.command.clampedYaw) {
+    horizontalGaze = std::max(
+        -1.0F, std::min(1.0F, static_cast<float>(g_state.lastSolve.unreachableYawDegrees) / 90.0F));
+  }
+  float verticalGaze = 0.0F;
+  if (g_state.hasSolve && g_state.lastSolve.command.clampedPitch) {
+    // Avatar の vertical は下が正。上を向くほど負にする。
+    verticalGaze = std::max(
+        -1.0F,
+        std::min(1.0F, static_cast<float>(-g_state.lastSolve.unreachablePitchDegrees) / 45.0F));
+  }
+  g_avatar.setRightGaze(verticalGaze, horizontalGaze);
+  g_avatar.setLeftGaze(verticalGaze, horizontalGaze);
 }
 
 } // namespace
@@ -634,8 +707,6 @@ void setup() {
   // 伴うので、何度読んでも「起動直後」しか観測できず、指した結果が見えない。
   Serial.begin(115200);
   M5.Display.setRotation(1);
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setTextSize(2);
 
   M5StackChan.begin();
   // 指した姿勢を保つために必須。既定では静止 200ms でトルクが切れて首が垂れる。
@@ -655,12 +726,15 @@ void setup() {
         static_cast<compass::Vec3*>(malloc(kCalibrationCapacity * sizeof(compass::Vec3)));
   }
 
-  // タッチセンサ (Si12T, 0x68) が I2C に居るかを起動時に一度確かめる。
-  // 実機でスワイプが 1 度も検出されなかったので、ジェスチャ判定の問題なのか
-  // センサまで届いていないのかを切り分ける。
   loadCalibration();
   loadLevel();
+  loadBiasTable();
   syncTime();
+
+  // 顔。以後 M5.Display へ直接書かない (Avatar が自前のスレッドで描くため)。
+  g_avatar.init();
+  // 吹き出しは日本語を出すので、既定の ASCII フォントでは化ける。
+  g_avatar.setSpeechFont(&fonts::lgfxJapanGothicP_16);
 
   if (!g_level.valid) {
     g_state.phase = app::Phase::Calibrating;
@@ -691,6 +765,7 @@ void loop() {
   gateInput.fieldMagnitudeMicroTesla = compass::magnitude(readMag());
   gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
   gateInput.yawDeciDegrees = actualYaw;
+  gateInput.biasCorrected = g_biasTable.isPopulated();
 
   // 停止した瞬間を 1 回だけ記録する。servoLikelyMoving() が静穏を確かめた上で
   // false を返すので、ゲート側の settle をさらに課すと待ちが二重になる。
@@ -724,10 +799,22 @@ void loop() {
   tick.lastReject = reject;
   tick.gyroMagnitudeDegPerSec = gateInput.gyroMagnitudeDegPerSec;
   tick.servoSettled = !gateInput.servoMoving;
+  tick.biasCorrected = g_biasTable.isPopulated();
   g_lastTickServoSettled = tick.servoSettled;
 
+  const app::Phase phaseBefore = g_state.phase;
   app::step(g_state, tick, g_config, g_observer);
   applyServoIntent(app::servoIntentFor(g_state), actualYaw);
+
+  // 学習を抜けた瞬間に 1 回だけ保存する。
+  // ビンが埋まるたびに書くと、サーボを動かしながらフラッシュに書くことになり、
+  // 実機ではそこで応答が止まった。
+  const bool leftLearning =
+      phaseBefore == app::Phase::LearningBias && g_state.phase != app::Phase::LearningBias;
+  if (leftLearning && g_biasDirty) {
+    saveBiasTable();
+    g_biasDirty = false;
+  }
 
   // 進捗をホストから確認するための最小限の記録。
   //
@@ -783,7 +870,7 @@ void loop() {
     // ゲートを通っていても、フィルタが溜まっていなければ方位は確定しない。
     Serial.printf("phase=%s target=%d rej=%d hdgOk=%d hdg=%.1f yaw=%d neckAbs=%.1f "
                   "tgtAz=%.1f alt=%.1f timeOk=%d touchN=%d calN=%u nS=%u settled=%d "
-                  "tI=%03d tSeen=%d\n",
+                  "tI=%03d tSeen=%d bias=%u\n",
                   app::phaseName(g_state.phase), static_cast<int>(g_state.target),
                   static_cast<int>(g_state.lastReject), g_headingValid ? 1 : 0,
                   static_cast<double>(g_bodyTrueHeading), yawDeci,
@@ -791,13 +878,14 @@ void loop() {
                   g_state.lastPosition.horizontal.altitudeDegrees, g_timeValid ? 1 : 0,
                   g_touchEventCount, static_cast<unsigned>(g_calibrationCount),
                   static_cast<unsigned>(g_headingFilter.sampleCount()),
-                  g_lastTickServoSettled ? 1 : 0, g_touchIntensity, g_touchSeenCount);
+                  g_lastTickServoSettled ? 1 : 0, g_touchIntensity, g_touchSeenCount,
+                  static_cast<unsigned>(g_biasTable.populatedBinCount()));
   }
 
   static std::uint32_t lastDraw = 0;
   if (now - lastDraw >= 200) {
     lastDraw = now;
-    drawStatus();
+    updateFace();
   }
 
   delay(10);

@@ -34,6 +34,8 @@ app::Tick tickAt(std::uint32_t nowMillis) {
   tick.headingValid = true;
   tick.measurementAccepted = true;
   tick.servoSettled = true;
+  // 首のクセを覚え終えた定常状態で見る。学習そのものは app-test で見る。
+  tick.biasCorrected = true;
   return tick;
 }
 

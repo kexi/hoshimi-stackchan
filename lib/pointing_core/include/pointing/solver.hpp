@@ -22,8 +22,13 @@ struct SolveInput {
   int currentYawDeciDegrees = 0;
   int currentPitchDeciDegrees = kPitchLevelDeci;
   BelowHorizonPolicy belowHorizonPolicy = BelowHorizonPolicy::PointAnyway;
-  // これ未満の変化では動かさない。サーボの分解能 0.3125 度より粗くする。
-  double deadbandDegrees = 0.5;
+  // これ未満の変化では動かさない。
+  //
+  // サーボの分解能 0.3125 度より粗くするだけでなく、方位測定のばらつきより
+  // 大きくする必要がある。バイアス補正後の方位は実機で 12 度ほど揺れており、
+  // 0.5 度だと毎周期 shouldMove が立って首が小刻みに揺れ続けた。指す精度は
+  // ±6 度に収まっているので、その範囲では動かさない。
+  double deadbandDegrees = 6.0;
 };
 
 struct SolveResult {

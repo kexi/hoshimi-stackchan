@@ -381,8 +381,11 @@ void testServoBiasTable() {
   CHECK_NEAR(table.correctionDegrees(0), 0.0, 1e-6);
 
   table.observe(0, 2.0F);
-  CHECK_TRUE(table.isPopulated());
   CHECK_NEAR(table.correctionDegrees(0), 2.0, 1e-5);
+  // 1 ビンでは補正として信用しない。未学習ビンは近いビンの値を借りるので、
+  // 1 つの値を全角度に当てることになり、遠い角度ほど外れる。
+  CHECK_TRUE(!table.isPopulated());
+  CHECK_TRUE(table.populatedBinCount() == 1);
 
   // 同じビンへの複数観測は平均される
   table.observe(0, 4.0F);
@@ -392,6 +395,13 @@ void testServoBiasTable() {
   table.observe(1200, -5.0F);
   CHECK_NEAR(table.correctionDegrees(1200), -5.0, 1e-5);
   CHECK_NEAR(table.correctionDegrees(0), 3.0, 1e-4);
+
+  // 首を全域に振ってビンが揃えば、補正として使える
+  for (int yawDeci = -1200; yawDeci <= 1200; yawDeci += 160) {
+    table.observe(yawDeci, static_cast<float>(yawDeci) / 100.0F);
+  }
+  CHECK_TRUE(table.populatedBinCount() >= compass::ServoBiasTable::kMinPopulatedBins);
+  CHECK_TRUE(table.isPopulated());
 
   // 可動域外の入力でも添字が飛ばない
   CHECK_TRUE(compass::ServoBiasTable::binIndexFor(-99999) == 0);

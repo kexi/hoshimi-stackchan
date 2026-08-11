@@ -60,6 +60,19 @@ bool applyInput(State& state, const Tick& tick) {
 
 } // namespace
 
+int learningYawFor(std::uint8_t step) {
+  // まず正面。ここで測った方位が、他の角度のずれを測るときの基準になる。
+  if (step == 0 || step >= kLearningStepCount) {
+    return compass::kMeasurementYawDeci;
+  }
+  // 残りで可動域 (-1280..1280) を等分に掃く。端まで舐めれば 16 ビンのうち
+  // 半分以上が埋まる。
+  constexpr int kSpan = pointing::kYawMaxDeci - pointing::kYawMinDeci;
+  const int sweepIndex = static_cast<int>(step) - 1;
+  const int sweepCount = static_cast<int>(kLearningStepCount) - 2;
+  return pointing::kYawMinDeci + kSpan * sweepIndex / sweepCount;
+}
+
 const char* phaseName(Phase phase) {
   switch (phase) {
   case Phase::InitHardware:
@@ -70,6 +83,8 @@ const char* phaseName(Phase phase) {
     return "SyncTime";
   case Phase::Calibrating:
     return "Calibrating";
+  case Phase::LearningBias:
+    return "LearningBias";
   case Phase::Idle:
     return "Idle";
   case Phase::ReturningToMeasurePose:
@@ -89,10 +104,24 @@ const char* phaseName(Phase phase) {
 ServoIntent servoIntentFor(const State& state) {
   ServoIntent intent;
 
+  // 学習中は首を順に振る。各角度で磁気を測り、正面との差を覚える。
+  if (state.phase == Phase::LearningBias) {
+    intent.yawDeciDegrees = learningYawFor(state.learningStep);
+    intent.pitchDeciDegrees = pointing::kPitchLevelDeci;
+    intent.shouldMove = true;
+    return intent;
+  }
+
   // 測定に関わる局面では、首を必ず正面へ。これがノイズ対策の本体。
-  const bool needsMeasurePose = state.phase == Phase::ReturningToMeasurePose ||
-                                state.phase == Phase::Measuring ||
-                                state.phase == Phase::Calibrating;
+  //
+  // ただしバイアス表が学習済みなら、首の角度によるずれは打ち消せるので
+  // 戻す必要がない。持ち歩きながら指し続けるにはこれが要る。
+  // キャリブレーション中は表の有無によらず正面で固定する (回転する円を
+  // 描くのに首が動いていると条件が変わってしまう)。
+  const bool measuringWithoutBias =
+      !state.biasCorrected &&
+      (state.phase == Phase::ReturningToMeasurePose || state.phase == Phase::Measuring);
+  const bool needsMeasurePose = measuringWithoutBias || state.phase == Phase::Calibrating;
   if (needsMeasurePose) {
     intent.yawDeciDegrees = compass::kMeasurementYawDeci;
     intent.pitchDeciDegrees = pointing::kPitchLevelDeci;
@@ -100,7 +129,10 @@ ServoIntent servoIntentFor(const State& state) {
     return intent;
   }
 
-  const bool canPoint = state.phase == Phase::Pointing || state.phase == Phase::Tracking;
+  // バイアス表があるなら測定中も指したままでよいので、その局面も含める。
+  const bool canPoint = state.phase == Phase::Pointing || state.phase == Phase::Tracking ||
+                        (state.biasCorrected && (state.phase == Phase::Measuring ||
+                                                 state.phase == Phase::ReturningToMeasurePose));
   if (!canPoint || !state.hasSolve) {
     return intent;
   }
@@ -131,6 +163,7 @@ astro::Target previousTarget(astro::Target current) {
 
 void step(State& state, const Tick& tick, const Config& config, const astro::Observer& observer) {
   state.lastReject = tick.lastReject;
+  state.biasCorrected = tick.biasCorrected;
 
   // 入力はどの状態でも受け付ける。ターゲットが変われば測り直しから入る。
   const bool targetChanged = applyInput(state, tick);
@@ -153,21 +186,63 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     return;
 
   case Phase::SyncTime:
-    enterPhase(state, tick.calibrationValid ? Phase::Idle : Phase::Calibrating, tick.nowMillis);
+    if (!tick.calibrationValid) {
+      enterPhase(state, Phase::Calibrating, tick.nowMillis);
+      return;
+    }
+    // キャリブレーション済みでも、首のクセを覚えていなければ先に学習する。
+    state.learningStep = 0;
+    enterPhase(state, tick.biasCorrected ? Phase::Idle : Phase::LearningBias, tick.nowMillis);
     return;
 
   case Phase::Calibrating:
-    // 8 の字回しが終わる (呼び出し側が calibrationValid を立てる) まで留まる。
+    // 水平回しが終わる (呼び出し側が calibrationValid を立てる) まで留まる。
     if (tick.calibrationValid) {
-      enterPhase(state, Phase::Idle, tick.nowMillis);
+      // 続けて首のクセを覚える。これが済むと首を正面へ戻さずに測れるので、
+      // 持ち歩きながら指し続けられる。
+      state.learningStep = 0;
+      enterPhase(state, tick.biasCorrected ? Phase::Idle : Phase::LearningBias, tick.nowMillis);
     }
     return;
+
+  case Phase::LearningBias: {
+    // 学習が足りたら抜ける。呼び出し側が各角度で観測を積む。
+    if (tick.biasCorrected) {
+      enterPhase(state, Phase::Idle, tick.nowMillis);
+      return;
+    }
+
+    // 首が目標へ着いて磁場が落ち着くまで待ち、次の角度へ進む。
+    const bool settled =
+        elapsedSince(tick.nowMillis, state.phaseEnteredMillis) >= config.measurePoseSettleMillis;
+    if (!settled) {
+      return;
+    }
+    if (state.learningStep + 1 < kLearningStepCount) {
+      ++state.learningStep;
+      state.phaseEnteredMillis = tick.nowMillis;
+      return;
+    }
+
+    // 一周しても足りなければ、もう一周する。実機では角度によって
+    // 磁場が安定せず、観測が採れないビンが出る。
+    state.learningStep = 0;
+    state.phaseEnteredMillis = tick.nowMillis;
+    return;
+  }
 
   case Phase::Idle:
     enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
     return;
 
   case Phase::ReturningToMeasurePose: {
+    // バイアス表があるなら首を戻す必要がない。待たずに測りに行く。
+    // 持ち歩きながら指し続けるには、ここで足を止めていられない。
+    if (state.biasCorrected) {
+      enterPhase(state, Phase::Measuring, tick.nowMillis);
+      return;
+    }
+
     // 首が正面に戻り、磁場が落ち着くまで待つ。ここを省くと首の角度による
     // バイアス (実測で最大 119 度) がそのまま方位に乗る。
     const bool settled =
@@ -232,8 +307,12 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     }
 
     // 機体ごと動かされたら方位が変わっているので測り直す。
+    //
+    // バイアス表があるなら戻らない。首を振ったままでも方位が読めるので、
+    // 追尾に留まったまま更新できる。持ち歩いている間は常に動いているので、
+    // ここで測定へ戻すと指すことも測ることもできなくなる。
     const bool bodyMoved = tick.gyroMagnitudeDegPerSec > config.bodyMovedGyroDegPerSec;
-    if (bodyMoved) {
+    if (bodyMoved && !state.biasCorrected) {
       enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
     }
@@ -253,6 +332,13 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     if (shouldRemeasure) {
       enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
+    }
+
+    // バイアス表があるなら、追尾しながら方位も更新し続ける。
+    // 持ち歩いて向きが変わっても、首が指し続けるために要る。
+    if (state.biasCorrected && tick.headingValid) {
+      state.bodyHeadingDegrees = tick.bodyTrueHeadingDegrees;
+      state.lastMeasureMillis = tick.nowMillis;
     }
 
     // 天体は動き続けるので、方位はそのままでも指令を更新する。

@@ -52,7 +52,10 @@ void MeasurementGate::resetReferenceField() {
 MeasurementGate::Reject MeasurementGate::evaluate(const Input& input) const {
   // 首が正面にないと最大 119 度ずれる (段階 8 実測)。他のどの要因より大きいので
   // 最初に見る。
-  if (!isMeasurementPose(input.yawDeciDegrees)) {
+  //
+  // ただし ServoBiasTable が学習済みなら、その角度のずれは打ち消せている。
+  // 首を正面へ戻さずに測れないと、持ち歩きながら指し続けることができない。
+  if (!input.biasCorrected && !isMeasurementPose(input.yawDeciDegrees)) {
     return Reject::NotMeasurementPose;
   }
 
@@ -159,7 +162,7 @@ float ServoBiasTable::correctionDegrees(int yawDeciDegrees) const {
   return 0.0F;
 }
 
-bool ServoBiasTable::isPopulated() const { return populatedBinCount() > 0; }
+bool ServoBiasTable::isPopulated() const { return populatedBinCount() >= kMinPopulatedBins; }
 
 std::size_t ServoBiasTable::populatedBinCount() const {
   std::size_t populated = 0;

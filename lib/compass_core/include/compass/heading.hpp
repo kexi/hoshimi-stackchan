@@ -19,6 +19,13 @@ struct Attitude {
 // mag はキャリブレーション適用済みの値を渡すこと。
 [[nodiscard]] float tiltCompensatedHeadingDegrees(Vec3 calibratedMag, Attitude attitude);
 
+// 角度を 0..360 に畳む。
+[[nodiscard]] float normalizeDegrees(float degrees);
+
+// from から to への符号つき角度差 [度, -180..180]。
+// 方位は円環量なので単純な引き算だと 359 と 1 の差が 358 になる。
+[[nodiscard]] float signedAngleDifference(float toDegrees, float fromDegrees);
+
 // 方位の指数移動平均。
 //
 // Why not 単純な移動平均: 方位は円環量なので 359 度と 1 度の平均が 180 度に

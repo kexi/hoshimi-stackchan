@@ -9,10 +9,10 @@
 // 緯度経度は天体の位置計算に使う。数 km ずれても方位への影響は無視できるが、
 // 100km 単位でずれると効いてくる。
 
-// 東京駅付近
-inline constexpr double kSiteLatitudeDegrees = 35.681236;
-inline constexpr double kSiteLongitudeEastDegrees = 139.767125;
+// 千葉市付近
+inline constexpr double kSiteLatitudeDegrees = 35.607;
+inline constexpr double kSiteLongitudeEastDegrees = 140.106;
 
 // 東経を正とする。日本は西偏なので負の値になる。
-// 2026 年の東京はおよそ西偏 7.9 度。
+// 2026 年の千葉はおよそ西偏 7.9 度。
 inline constexpr float kSiteDeclinationEast = -7.9F;

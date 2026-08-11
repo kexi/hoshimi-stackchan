@@ -66,6 +66,11 @@ public:
     float headingDispersionDegrees = 0.0F;
     // 測定時の首の角度。正面から外れていると採用しない。
     int yawDeciDegrees = 0;
+    // 首の角度によるずれを補正できるか (ServoBiasTable が学習済みか)。
+    //
+    // 真なら首が横を向いていても測ってよい。持ち歩きながら指し続けるには、
+    // 指した姿勢のまま方位を追える必要がある。
+    bool biasCorrected = false;
   };
 
   enum class Reject : std::uint8_t {
@@ -109,6 +114,12 @@ public:
   static constexpr std::size_t kBinCount = 16;
   static constexpr int kYawMinDeci = -1280;
   static constexpr int kYawMaxDeci = 1280;
+  // 補正として信用するのに要るビン数。
+  //
+  // 未学習ビンは近いビンの値を借りるが、実測の誤差は角度にほぼ比例して
+  // 増える (16 ビンで 119 度 = 1 ビンあたり約 7 度)。1 ビンしか無い状態で
+  // 全角度に同じ値を当てると、遠い角度ほど外れる。半分は埋めてから使う。
+  static constexpr std::size_t kMinPopulatedBins = 8;
 
   void reset();
   void observe(int yawDeciDegrees, float headingErrorDegrees);

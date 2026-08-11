@@ -10,6 +10,8 @@ constexpr float kPi = 3.14159265358979323846F;
 constexpr float kRad2Deg = 180.0F / kPi;
 constexpr float kDeg2Rad = kPi / 180.0F;
 
+} // namespace
+
 float normalizeDegrees(float degrees) {
   float wrapped = std::fmod(degrees, 360.0F);
   if (wrapped < 0.0F) {
@@ -21,7 +23,9 @@ float normalizeDegrees(float degrees) {
   return wrapped;
 }
 
-} // namespace
+float signedAngleDifference(float toDegrees, float fromDegrees) {
+  return normalizeDegrees(toDegrees - fromDegrees + 180.0F) - 180.0F;
+}
 
 Attitude attitudeFromAccel(Vec3 accel) {
   Attitude attitude;

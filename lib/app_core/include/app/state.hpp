@@ -15,6 +15,10 @@ enum class Phase : std::uint8_t {
   ConnectWifi,
   SyncTime,
   Calibrating,
+  // 首を左右に振って、角度ごとの磁気のずれを覚える。
+  // これが済むと、首を正面に戻さなくても方位が読めるようになり、
+  // 持ち歩きながら天体を指し続けられる。
+  LearningBias,
   Idle,
   // 首を正面へ戻す。ここを挟まないと、首の角度によって方位が最大 119 度ずれる
   // (段階 8 実測)。磁気測定の前提を揃えるための姿勢。
@@ -27,6 +31,13 @@ enum class Phase : std::uint8_t {
 
 [[nodiscard]] const char* phaseName(Phase phase);
 
+// 首のクセを学習するときに通す角度の数。可動域を等分に掃く。
+// 16 ビンのうち半分以上を埋めたいので、それより多く採る。
+inline constexpr std::uint8_t kLearningStepCount = 12;
+
+// 学習の step 段目で首を向ける角度 [deci-degree]。
+[[nodiscard]] int learningYawFor(std::uint8_t step);
+
 // スワイプの向き。
 enum class Input : std::uint8_t {
   None,
@@ -37,9 +48,13 @@ enum class Input : std::uint8_t {
 
 struct Config {
   // 方位を測り直す間隔。天体は動くが、方位は機体が動かない限り変わらない。
-  // 短すぎると首が頻繁に正面へ戻って落ち着かないが、長すぎると一度おかしな
-  // 方位を掴んだときに復帰までが遠い。
-  std::uint32_t remeasureIntervalMillis = 20000;
+  // 定期的な測り直しの間隔。
+  //
+  // 機体が動いていないなら方位は変わらないので、本来は測り直す必要がない。
+  // 20 秒にしていたときは、指した先から定期的に首が正面へ戻る動きが目立ち、
+  // 「意味もなく首を振っている」ようにしか見えなかった。機体の動きは
+  // ジャイロで拾えるので、これは保険として長めに置く。
+  std::uint32_t remeasureIntervalMillis = 600000;
   // 自動巡回時に次のターゲットへ移る間隔。
   std::uint32_t autoCycleIntervalMillis = 8000;
   // サーボ指令を出してから収束したとみなすまでの時間。
@@ -76,6 +91,12 @@ struct Tick {
 
   float gyroMagnitudeDegPerSec = 0.0F;
   bool servoSettled = true;
+
+  // 首の角度によるずれを補正できるか (ServoBiasTable が学習済みか)。
+  //
+  // 真なら首を正面へ戻さずに測れるので、指したまま追尾を続けられる。
+  // 持ち歩きながら観測するにはこれが要る。
+  bool biasCorrected = false;
 };
 
 struct State {
@@ -99,6 +120,13 @@ struct State {
   // 解釈して測定に戻り、また指しては戻るのを繰り返した。
   float bodyHeadingDegrees = 0.0F;
   bool hasHeading = false;
+
+  // 首の角度によるずれを補正できるか。tick から写して持つ。
+  // servoIntentFor() は State しか見ないので、ここに置く必要がある。
+  bool biasCorrected = false;
+
+  // 学習中に首を振っている段階。0 から kLearningStepCount-1 まで進む。
+  std::uint8_t learningStep = 0;
 
   compass::MeasurementGate::Reject lastReject = compass::MeasurementGate::Reject::None;
 };

@@ -30,6 +30,15 @@ app::Tick healthyTick(std::uint32_t nowMillis) {
   tick.headingValid = true;
   tick.measurementAccepted = true;
   tick.servoSettled = true;
+  // 学習済みの定常状態を既定にする。学習そのものは専用のテストで見る。
+  tick.biasCorrected = true;
+  return tick;
+}
+
+// 首のクセをまだ覚えていない状態。首を正面へ戻さないと方位が読めない。
+app::Tick uncorrectedTick(std::uint32_t nowMillis) {
+  app::Tick tick = healthyTick(nowMillis);
+  tick.biasCorrected = false;
   return tick;
 }
 
@@ -39,6 +48,26 @@ void advanceUntil(app::State& state, app::Phase wanted, std::uint32_t& clock,
   for (int guard = 0; guard < 500 && state.phase != wanted; ++guard) {
     clock += 200;
     app::step(state, healthyTick(clock), config, tokyoObserver());
+  }
+}
+
+// 学習は済ませた上で、補正を使わない状態から進める。
+//
+// LearningBias は補正が無い限り抜けないので、いったん補正ありで追尾まで
+// 進めてから補正を外す。実機で言えば「覚えた表が使えなくなった」状況。
+// 再測定の周期は長いので、機体を動かして測り直しの契機を作る。
+void advanceUncorrected(app::State& state, app::Phase wanted, std::uint32_t& clock,
+                        const app::Config& config) {
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+
+  clock += 200;
+  app::Tick shaken = uncorrectedTick(clock);
+  shaken.gyroMagnitudeDegPerSec = 120.0F;
+  app::step(state, shaken, config, tokyoObserver());
+
+  for (int guard = 0; guard < 500 && state.phase != wanted; ++guard) {
+    clock += 200;
+    app::step(state, uncorrectedTick(clock), config, tokyoObserver());
   }
 }
 
@@ -226,6 +255,8 @@ void testTrackingEscapesWhenHeadingWasNeverTaken() {
 }
 
 void testBodyMovementTriggersRemeasure() {
+  // 首のクセをまだ覚えていないときは、機体が動いたら測り直すこと。
+  // この状態では首を正面へ戻さないと方位が読めない。
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
@@ -234,10 +265,108 @@ void testBodyMovementTriggersRemeasure() {
 
   clock += 200;
   app::Tick shaken = healthyTick(clock);
+  shaken.biasCorrected = false;
   shaken.gyroMagnitudeDegPerSec = 120.0F;
   app::step(state, shaken, config, tokyoObserver());
   // 機体が動かされたら、首を正面に戻して測り直す
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+}
+
+void testLearningSweepsNeckAcrossRange() {
+  // 首のクセを覚える局面が、可動域を端まで掃くこと。
+  //
+  // 16 ビンのうち半分以上を埋めないと補正として使えないので、
+  // 特定の角度だけ通っても足りない。
+  const int first = app::learningYawFor(0);
+  CHECK_TRUE(first == compass::kMeasurementYawDeci);
+
+  int minYaw = first;
+  int maxYaw = first;
+  for (std::uint8_t step = 0; step < app::kLearningStepCount; ++step) {
+    const int yaw = app::learningYawFor(step);
+    CHECK_TRUE(pointing::isYawReachable(yaw));
+    minYaw = yaw < minYaw ? yaw : minYaw;
+    maxYaw = yaw > maxYaw ? yaw : maxYaw;
+  }
+  CHECK_TRUE(minYaw == pointing::kYawMinDeci);
+  CHECK_TRUE(maxYaw == pointing::kYawMaxDeci);
+}
+
+void testLearningPhaseRunsBeforeIdle() {
+  // 首のクセを覚えていなければ、追尾に入る前に学習へ寄ること。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+
+  for (int step = 0; step < 40 && state.phase != app::Phase::LearningBias; ++step) {
+    clock += 200;
+    app::Tick tick = healthyTick(clock);
+    tick.biasCorrected = false;
+    app::step(state, tick, config, tokyoObserver());
+  }
+  CHECK_TRUE(state.phase == app::Phase::LearningBias);
+
+  // 覚え終われば先へ進む
+  clock += 200;
+  app::step(state, healthyTick(clock), config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::Idle);
+}
+
+void testBiasCorrectedTrackingSurvivesMovement() {
+  // バイアス表が学習済みなら、持ち歩いて機体が動き続けても追尾に留まること。
+  //
+  // 首の角度によるずれを打ち消せるので、首を正面へ戻さなくても方位が読める。
+  // ここで測定に戻ると、歩いている間は指すことも測ることもできなくなる。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+
+  // バイアス補正が効いた状態で追尾まで進める
+  auto movingTick = [&](std::uint32_t nowMillis) {
+    app::Tick tick = healthyTick(nowMillis);
+    tick.biasCorrected = true;
+    tick.gyroMagnitudeDegPerSec = 120.0F; // 歩いている
+    return tick;
+  };
+
+  for (int step = 0; step < 400 && state.phase != app::Phase::Tracking; ++step) {
+    clock += 200;
+    app::step(state, movingTick(clock), config, tokyoObserver());
+  }
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+
+  // 揺れ続けても追尾から出ない
+  for (int step = 0; step < 100; ++step) {
+    clock += 200;
+    app::step(state, movingTick(clock), config, tokyoObserver());
+    CHECK_TRUE(state.phase == app::Phase::Tracking);
+  }
+  // 動きながらでも指令が更新され続けること
+  CHECK_TRUE(state.hasSolve);
+}
+
+void testBiasCorrectedSkipsMeasurePose() {
+  // バイアス表があるなら、測定のために首を正面へ戻さないこと。
+  //
+  // 戻すと指している方向を見失う。持ち歩きながら指し続けるには、
+  // 指したままの姿勢で測れる必要がある。
+  app::State withBias;
+  withBias.biasCorrected = true;
+  withBias.phase = app::Phase::Measuring;
+  withBias.hasSolve = true;
+  withBias.lastSolve.command.yawDeciDegrees = 700;
+  withBias.lastSolve.command.pitchDeciDegrees = 600;
+  withBias.lastSolve.shouldMove = true;
+
+  const app::ServoIntent corrected = app::servoIntentFor(withBias);
+  CHECK_TRUE(corrected.yawDeciDegrees == 700);
+
+  // 表が無ければ従来どおり正面へ戻す
+  app::State withoutBias = withBias;
+  withoutBias.biasCorrected = false;
+
+  const app::ServoIntent uncorrected = app::servoIntentFor(withoutBias);
+  CHECK_TRUE(uncorrected.yawDeciDegrees == compass::kMeasurementYawDeci);
 }
 
 void testMillisWrapDoesNotBreakTransitions() {
@@ -299,11 +428,14 @@ void testMeasurementPoseIsCommanded() {
   app::Config config;
   std::uint32_t clock = 0;
 
-  // Measuring / ReturningToMeasurePose を通るまで進める
+  // Measuring / ReturningToMeasurePose を通るまで進める。
+  // 補正が使えないときは、測定のたびに正面へ戻る必要がある。
+  advanceUncorrected(state, app::Phase::ReturningToMeasurePose, clock, config);
+
   bool sawMeasurePose = false;
-  for (int step = 0; step < 40; ++step) {
+  for (int step = 0; step < 60; ++step) {
     clock += 200;
-    app::step(state, healthyTick(clock), config, tokyoObserver());
+    app::step(state, uncorrectedTick(clock), config, tokyoObserver());
     const bool isMeasurePhase =
         state.phase == app::Phase::ReturningToMeasurePose || state.phase == app::Phase::Measuring;
     if (!isMeasurePhase) {
@@ -362,17 +494,18 @@ void testMeasurePoseSettleIsRespected() {
   config.measurePoseSettleMillis = 1000;
   std::uint32_t clock = 0;
 
-  advanceUntil(state, app::Phase::ReturningToMeasurePose, clock, config);
+  // 首のクセを覚える前は、正面へ戻して落ち着くのを待つ必要がある。
+  advanceUncorrected(state, app::Phase::ReturningToMeasurePose, clock, config);
   const std::uint32_t entered = clock;
 
   // settle 未満では Measuring に進まない
   clock += 400;
-  app::step(state, healthyTick(clock), config, tokyoObserver());
+  app::step(state, uncorrectedTick(clock), config, tokyoObserver());
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 
   // settle を超えたら進む
   clock = entered + 1200;
-  app::step(state, healthyTick(clock), config, tokyoObserver());
+  app::step(state, uncorrectedTick(clock), config, tokyoObserver());
   CHECK_TRUE(state.phase == app::Phase::Measuring);
 }
 
@@ -392,6 +525,10 @@ int main() {
   testTrackingStaysWhileNeckIsAway();
   testTrackingEscapesWhenHeadingWasNeverTaken();
   testBodyMovementTriggersRemeasure();
+  testLearningSweepsNeckAcrossRange();
+  testLearningPhaseRunsBeforeIdle();
+  testBiasCorrectedTrackingSurvivesMovement();
+  testBiasCorrectedSkipsMeasurePose();
   testMillisWrapDoesNotBreakTransitions();
   testTrackingUpdatesAsSkyMoves();
   return testing::summarize("app");
