@@ -102,7 +102,7 @@ void testMeasurementTimeoutWithoutHeading() {
 
   // まず Measuring まで進める。
   // 首を正面に戻す ReturningToMeasurePose を挟むので、その settle 時間も要る。
-  for (int step = 0; step < 12; ++step) {
+  for (int step = 0; step < 17; ++step) {
     clock += 200;
     app::Tick tick = healthyTick(clock);
     tick.measurementAccepted = false;
@@ -201,17 +201,23 @@ void testMillisWrapDoesNotBreakTransitions() {
   // millis() は約 49.7 日で 32bit を巻き戻る。またいでも遷移が壊れないこと。
   app::State state;
   app::Config config;
-  std::uint32_t clock = 0xFFFFF000U;
+  // Tracking に入るまでに必要な時間ぶん手前から始め、巻き戻りが
+  // 追尾中に起きるようにする。
+  std::uint32_t clock = 0xFFFF0000U;
   advanceUntil(state, app::Phase::Tracking, clock, config);
   CHECK_TRUE(state.phase == app::Phase::Tracking);
 
-  // 巻き戻りをまたいで進めても、Tracking から抜けて測り直しに入れる
-  const std::uint32_t beforeWrap = clock;
-  for (int step = 0; step < 400; ++step) {
+  // 巻き戻りを確実にまたぐ。0xFFFFFFFF を越えると 0 に戻る。
+  bool wrapped = false;
+  for (int step = 0; step < 2000; ++step) {
+    const std::uint32_t previous = clock;
     clock += 200;
+    if (clock < previous) {
+      wrapped = true;
+    }
     app::step(state, healthyTick(clock), config, tokyoObserver());
   }
-  CHECK_TRUE(clock < beforeWrap); // 実際に巻き戻った
+  CHECK_TRUE(wrapped); // 実際に巻き戻った
   CHECK_TRUE(state.phase != app::Phase::Error);
   CHECK_TRUE(state.hasSolve);
 }
@@ -283,6 +289,14 @@ void testMeasurementPoseIsCommanded() {
   CHECK_TRUE(tracking.pitchDeciDegrees == state.lastSolve.command.pitchDeciDegrees);
 }
 
+void testMeasurePoseSettleOutlastsServoTravel() {
+  // 既定値の関係が崩れると、首がまだ動いている最中に Measuring へ進んでしまう。
+  // するとゲートが servoMoving で弾き続け、タイムアウト後に汚れた方位が
+  // 採用される (実機で首が西を向いた不具合の原因)。
+  const app::Config config;
+  CHECK_TRUE(config.measurePoseSettleMillis > config.servoSettleMillis);
+}
+
 void testMeasurePoseSettleIsRespected() {
   // 首を戻した直後に測ると意味がないので、settle 時間は必ず待つこと。
   app::State state;
@@ -308,6 +322,7 @@ void testMeasurePoseSettleIsRespected() {
 
 int main() {
   testMeasurementPoseIsCommanded();
+  testMeasurePoseSettleOutlastsServoTravel();
   testMeasurePoseSettleIsRespected();
   testBootReachesTracking();
   testCalibrationGate();

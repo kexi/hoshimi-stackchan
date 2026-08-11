@@ -37,14 +37,19 @@ enum class Input : std::uint8_t {
 
 struct Config {
   // 方位を測り直す間隔。天体は動くが、方位は機体が動かない限り変わらない。
-  std::uint32_t remeasureIntervalMillis = 60000;
+  // 短すぎると首が頻繁に正面へ戻って落ち着かないが、長すぎると一度おかしな
+  // 方位を掴んだときに復帰までが遠い。
+  std::uint32_t remeasureIntervalMillis = 20000;
   // 自動巡回時に次のターゲットへ移る間隔。
   std::uint32_t autoCycleIntervalMillis = 8000;
   // サーボ指令を出してから収束したとみなすまでの時間。
   std::uint32_t servoSettleMillis = 1200;
-  // 首を正面に戻してから磁気を測り始めるまでの待ち。実測の収束 300ms に
-  // 首の移動時間を足した値。
-  std::uint32_t measurePoseSettleMillis = 1000;
+  // 首を正面に戻してから磁気を測り始めるまでの待ち。
+  // 必ず servoSettleMillis より長くすること。短いと首がまだ動いている最中に
+  // Measuring へ進み、ゲートが servoMoving で弾き続けてタイムアウトし、
+  // 汚れた方位がそのまま採用される。
+  // 内訳: 首の移動 1200ms + 磁場の収束 300ms (実測) + 余裕。
+  std::uint32_t measurePoseSettleMillis = 2000;
   // 測定に使うサンプル数と、諦めるまでの時間。
   std::uint32_t measureTimeoutMillis = 5000;
   // 機体が動かされたと判断するジャイロのしきい値。

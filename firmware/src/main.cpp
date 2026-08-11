@@ -37,6 +37,9 @@
 namespace {
 
 constexpr const char* kCalibrationNamespace = "magcal";
+// 動作中の内部状態を残す。USB シリアルが使えないので、ずれの原因を
+// 切り分けるにはこれを読むしかない。
+constexpr const char* kDebugNamespace = "live";
 constexpr int kMoveSpeed = 400;
 constexpr std::uint32_t kWifiTimeoutMillis = 20000;
 
@@ -145,6 +148,17 @@ void commandServo(int yawDeci, int pitchDeci) {
   if (unchanged) {
     return;
   }
+  // 測定姿勢から離れるなら、溜めた方位を捨てる。首が動いた後に古い平均が
+  // 残っていると、次に正面へ戻ったとき汚れた値が即座に採用されてしまう。
+  const bool leavingMeasurePose =
+      compass::isMeasurementPose(g_commandedYaw) && !compass::isMeasurementPose(yawDeci);
+  if (leavingMeasurePose) {
+    g_headingFilter.reset();
+    // 方位も無効に戻す。首が動いた後も古い値を「有効」と見なしていると、
+    // 次の Measuring がその場で成立してしまい、測り直しの意味がなくなる。
+    g_headingValid = false;
+  }
+
   g_commandedYaw = yawDeci;
   g_commandedPitch = pitchDeci;
   g_lastServoCommandMillis = millis();
@@ -181,15 +195,52 @@ void updateHeading() {
     return;
   }
 
+  // 首が正面にないときの値をフィルタに入れてはいけない。
+  // ゲートは「採用するか」を判断するだけで、フィルタの中身までは面倒を見ない。
+  // 首を振っている間の値を溜め込むと、正面に戻った頃には平均が汚染されていて、
+  // ゲートを通った瞬間に誤った方位を採用してしまう (実機で西を向く不具合の原因)。
+  const bool poseIsClean =
+      compass::isMeasurementPose(g_commandedYaw) && !servoLikelyMoving(millis());
+  if (!poseIsClean) {
+    return;
+  }
+
   const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
   const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
   const float magneticHeading = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
   g_headingFilter.update(magneticHeading);
 
-  // 静穏時の |B| を学習する。採用できる状況のときだけ。
-  if (compass::isMeasurementPose(g_commandedYaw) && !servoLikelyMoving(millis())) {
-    g_gate.learnReferenceField(compass::magnitude(raw));
+  g_gate.learnReferenceField(compass::magnitude(raw));
+}
+
+// 生の磁気・方位・指令を NVS に残す。ずれの原因 (軸か、偏角か、残差か) を
+// 切り分けるために、途中の値をすべて見えるようにしておく。
+void saveLiveState() {
+  Preferences preferences;
+  if (!preferences.begin(kDebugNamespace, false)) {
+    return;
   }
+  const compass::Vec3 raw = readMag();
+  const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
+  const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
+
+  preferences.putInt("rawX", static_cast<int>(std::lround(raw.x * 10.0F)));
+  preferences.putInt("rawY", static_cast<int>(std::lround(raw.y * 10.0F)));
+  preferences.putInt("rawZ", static_cast<int>(std::lround(raw.z * 10.0F)));
+  preferences.putInt("corX", static_cast<int>(std::lround(corrected.x * 10.0F)));
+  preferences.putInt("corY", static_cast<int>(std::lround(corrected.y * 10.0F)));
+  preferences.putInt("corZ", static_cast<int>(std::lround(corrected.z * 10.0F)));
+  preferences.putInt("magHdg",
+                     static_cast<int>(std::lround(
+                         compass::tiltCompensatedHeadingDegrees(corrected, attitude) * 10.0F)));
+  preferences.putInt("fltHdg",
+                     static_cast<int>(std::lround(g_headingFilter.valueDegrees() * 10.0F)));
+  preferences.putInt("trueHdg", static_cast<int>(std::lround(g_bodyTrueHeading * 10.0F)));
+  preferences.putInt("cmdYaw", g_commandedYaw);
+  preferences.putInt("phase", static_cast<int>(g_state.phase));
+  preferences.putInt("reject", static_cast<int>(g_state.lastReject));
+  preferences.putInt("hdgOk", g_headingValid ? 1 : 0);
+  preferences.end();
 }
 
 void drawStatus() {
@@ -309,8 +360,11 @@ void loop() {
   }
 
   const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
-  const bool accepted = reject == compass::MeasurementGate::Reject::None;
-  if (accepted && g_headingFilter.hasValue()) {
+  // フィルタが空 (= 測定姿勢での有効なサンプルをまだ 1 つも取れていない) なら、
+  // ゲートを通っていても採用できない。
+  const bool accepted =
+      reject == compass::MeasurementGate::Reject::None && g_headingFilter.hasValue();
+  if (accepted) {
     g_bodyTrueHeading =
         compass::trueHeadingFromMagnetic(g_headingFilter.valueDegrees(), kSiteDeclinationEast);
     g_headingValid = true;
@@ -340,6 +394,13 @@ void loop() {
   if (now - lastDraw >= 200) {
     lastDraw = now;
     drawStatus();
+  }
+
+  // NVS への書き込みはフラッシュを消耗するので、頻度は抑える。
+  static std::uint32_t lastDebugSave = 0;
+  if (now - lastDebugSave >= 3000) {
+    lastDebugSave = now;
+    saveLiveState();
   }
 
   delay(10);
