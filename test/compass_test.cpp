@@ -100,6 +100,68 @@ void testCalibrationRejectsInsufficientData() {
   CHECK_NEAR(passthrough.z, 3.0, 1e-6);
 }
 
+void testCalibrationRejectsNarrowRotation() {
+  // 回す範囲が狭いと、min/max の中心が「回した範囲の中心」= 現在の磁場に
+  // なってしまう。補正すると水平成分がほぼゼロになり、atan2 がノイズを
+  // 拾って方位が全方位に散らばる (実機で発生した不具合)。
+  //
+  // 各軸のレンジは十分でも、球の直径が地磁気の 2 倍に届かないなら不採用。
+  constexpr float kFieldRadius = 46.0F;
+  const compass::Vec3 center{-129.4F, 1.5F, 340.3F}; // 実機で観測されたオフセット
+
+  compass::CalibrationCollector narrow;
+  for (int index = 0; index < 500; ++index) {
+    // 半径 15uT ぶんしか掃いていない (実機で 8 の字が小さかった状況)
+    const float angle = (static_cast<float>(index) / 500.0F) * 2.0F * kPi;
+    compass::Vec3 sample;
+    sample.x = center.x + 15.0F * std::cos(angle);
+    sample.y = center.y + 15.0F * std::sin(angle);
+    sample.z = center.z + 15.0F * std::sin(angle * 2.0F);
+    narrow.addSample(sample);
+  }
+  CHECK_TRUE(!narrow.finish().valid);
+
+  // 実機で実際に採用されてしまった条件。伏角 49 度の日本では Z が大きいので、
+  // 3 軸の平均を見ると Z に助けられて通る。水平 2 軸を直接見ないと弾けない。
+  // このときの補正後の水平成分は 18.6uT で、地磁気 (約 30uT) の 6 割しかなく、
+  // 方位が全方位に散らばった。
+  compass::CalibrationCollector verticalHeavy;
+  for (int index = 0; index < 500; ++index) {
+    const float angle = (static_cast<float>(index) / 500.0F) * 2.0F * kPi;
+    compass::Vec3 sample;
+    sample.x = center.x + 21.0F * std::cos(angle); // 水平は狭い
+    sample.y = center.y + 27.0F * std::sin(angle);
+    sample.z = center.z + 44.0F * std::sin(angle * 3.0F); // Z だけ広い
+    verticalHeavy.addSample(sample);
+  }
+  CHECK_TRUE(!verticalHeavy.finish().valid);
+
+  // 十分に回せば採用される
+  compass::CalibrationCollector wide;
+  for (int elevationStep = -8; elevationStep <= 8; ++elevationStep) {
+    for (int azimuthStep = 0; azimuthStep < 24; ++azimuthStep) {
+      const float elevation = (static_cast<float>(elevationStep) / 8.0F) * (kPi / 2.0F);
+      const float azimuth = (static_cast<float>(azimuthStep) / 24.0F) * 2.0F * kPi;
+      compass::Vec3 sample;
+      sample.x = center.x + kFieldRadius * std::cos(elevation) * std::cos(azimuth);
+      sample.y = center.y + kFieldRadius * std::cos(elevation) * std::sin(azimuth);
+      sample.z = center.z + kFieldRadius * std::sin(elevation);
+      wide.addSample(sample);
+    }
+  }
+  const compass::MagCalibration good = wide.finish();
+  CHECK_TRUE(good.valid);
+
+  // 採用されたキャリブレーションなら、補正後の水平成分が地磁気相当の
+  // 大きさを持つこと。ここがゼロ付近だと方位が出せない。
+  compass::Vec3 probe;
+  probe.x = center.x + kFieldRadius;
+  probe.y = center.y;
+  probe.z = center.z;
+  const compass::Vec3 corrected = compass::applyCalibration(good, probe);
+  CHECK_TRUE(std::hypot(corrected.x, corrected.y) > 20.0F);
+}
+
 void testTiltCompensationRoundTrip() {
   // 本質的なテスト: 水平な機体で方位 H を作る磁場を用意し、機体を傾けたときに
   // 観測されるであろう値を合成して、傾斜補正が H を復元できるか見る。
@@ -189,6 +251,33 @@ void testHeadingFilterIsCircular() {
   // 値が溜まる前に測定を打ち切ってしまう (実機で方位が確定しなかった一因)。
   CHECK_NEAR(filter.dispersionDegrees(), 0.0, 1e-6);
   CHECK_TRUE(!filter.hasValue()); // 有無の判断は hasValue() で行う
+}
+
+void testFilterConvergenceGuard() {
+  // 指数移動平均は最初の数サンプルが初期値に引きずられる。
+  // 収束前の値を採用すると方位が大きく揺れる (実機で ±40 度)。
+  // sampleCount を見て、十分溜まるまで採用させないこと。
+  compass::HeadingFilter filter(0.5F);
+  CHECK_TRUE(filter.sampleCount() == 0);
+  CHECK_TRUE(!filter.hasConverged(16));
+
+  // 90 度から 270 度へ切り替わる状況を作る。最初の数サンプルでは
+  // まだ 90 度側に引きずられている。
+  filter.update(90.0F);
+  CHECK_TRUE(filter.sampleCount() == 1);
+  CHECK_TRUE(!filter.hasConverged(16)); // 1 サンプルでは採用させない
+
+  for (int index = 0; index < 30; ++index) {
+    filter.update(270.0F);
+  }
+  CHECK_TRUE(filter.hasConverged(16));
+  // 十分溜まれば新しい値に落ち着く
+  CHECK_NEAR_ANGLE(filter.valueDegrees(), 270.0, 1.0);
+
+  // reset で数え直す
+  filter.reset();
+  CHECK_TRUE(filter.sampleCount() == 0);
+  CHECK_TRUE(!filter.hasConverged(1));
 }
 
 void testMeasurementGate() {
@@ -345,9 +434,11 @@ void testDeclination() {
 int main() {
   testCalibrationRecovery();
   testCalibrationRejectsInsufficientData();
+  testCalibrationRejectsNarrowRotation();
   testTiltCompensationRoundTrip();
   testAttitudeFromAccel();
   testHeadingFilterIsCircular();
+  testFilterConvergenceGuard();
   testMeasurementGate();
   testMeasurementPoseGate();
   testServoBiasTable();

@@ -32,6 +32,16 @@ struct CalibrationConfig {
   float minAxisRangeMicroTesla = 20.0F;
   // 最長軸 / 最短軸。これを超えたら回し方が偏っていると見なす。
   float maxAxisRangeRatio = 3.0F;
+  // 水平 2 軸 (X, Y) それぞれの直径の下限。
+  //
+  // 水平に一回転すれば、各軸は地磁気の水平成分 (日本で約 30uT) の ±ぶん、
+  // つまり 60uT 幅を掃く。これを下回るなら回し足りていない。
+  //
+  // Why not 3 軸の平均: 伏角 49 度の日本では Z 成分が水平成分より大きいので、
+  // 平均を見ると Z に助けられて通ってしまう。実機ではそれで水平成分が
+  // 18uT (地磁気の 6 割) しかないキャリブレーションが採用され、方位が
+  // 全方位に散らばった。方位は水平成分からしか出ないので、そこを直接見る。
+  float minFieldDiameterMicroTesla = 45.0F;
 };
 
 // 8 の字回し中のサンプルから min/max を集め、中心とスケールを出す。
@@ -48,6 +58,9 @@ public:
   // UI の進捗表示用。0..1 で、1 になれば finish() が valid を返せる見込み。
   [[nodiscard]] float coverage() const;
   [[nodiscard]] MagCalibration finish() const;
+
+  // 各軸で掃いた幅 [uT]。回し足りない軸を UI に出すために使う。
+  [[nodiscard]] Vec3 axisSpan() const;
 
 private:
   CalibrationConfig config_;

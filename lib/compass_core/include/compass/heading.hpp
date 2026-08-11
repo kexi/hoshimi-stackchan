@@ -2,6 +2,8 @@
 
 #include "compass/calibration.hpp"
 
+#include <cstddef>
+
 namespace compass {
 
 // 機体の傾き。加速度計から求める。
@@ -33,11 +35,19 @@ public:
   // 直近のばらつき [度]。合成ベクトルの長さが 1 から離れるほど散らばっている。
   [[nodiscard]] float dispersionDegrees() const;
 
+  // 取り込んだサンプル数。収束の判断に使う。
+  //
+  // 指数移動平均は数サンプルでは初期値に引きずられる。これを見ずに判定すると、
+  // 収束前の値を「測れた」と誤って採用する (実機で方位が ±40 度揺れた原因)。
+  [[nodiscard]] std::size_t sampleCount() const;
+  [[nodiscard]] bool hasConverged(std::size_t minimumSamples) const;
+
 private:
   float smoothing_;
   float sumSin_ = 0.0F;
   float sumCos_ = 0.0F;
   bool hasValue_ = false;
+  std::size_t sampleCount_ = 0;
 };
 
 } // namespace compass

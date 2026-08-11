@@ -175,9 +175,29 @@ void commandServo(int yawDeci, int pitchDeci, int actualYaw) {
   M5StackChan.Motion.move(yawDeci, pitchDeci, kMoveSpeed);
 }
 
-// 指令からの経過で動作中かを推定する。UART 問い合わせを毎周期しないための近似。
-bool servoLikelyMoving(std::uint32_t nowMillis) {
-  return nowMillis - g_lastServoCommandMillis < g_config.servoSettleMillis;
+// 首が動いているかを、実際の角度の変化で判定する。
+//
+// Why not 指令からの経過時間だけを見る: 指令を出すたびに一定時間を無条件で
+// 「動作中」とすると、首が既に目標にいて動く必要がない場合まで動作中と
+// 扱われる。ゲートが ServoMoving を返し続け、磁気が一切採用されない
+// (実機でフィルタが空のままだった原因)。
+//
+// 角度が動いていないことを確かめてから、さらに settle 時間だけ待つ。
+bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
+  static int lastYaw = 0;
+  static std::uint32_t lastChangeMillis = 0;
+
+  // サーボの分解能は 3.125 deci-degree。これ以下の差は測定ノイズとみなす。
+  constexpr int kMovementThresholdDeci = 5;
+  if (std::abs(actualYaw - lastYaw) > kMovementThresholdDeci) {
+    lastYaw = actualYaw;
+    lastChangeMillis = nowMillis;
+    return true;
+  }
+
+  // 磁場が落ち着くまでの実測値 300ms に余裕を持たせる
+  constexpr std::uint32_t kQuietMillis = 500;
+  return nowMillis - lastChangeMillis < kQuietMillis;
 }
 
 // 測定姿勢の判定に使う首の角度。
@@ -277,7 +297,8 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
   // ゲートは「採用するか」を判断するだけで、フィルタの中身までは面倒を見ない。
   // 首を振っている間の値を溜め込むと、正面に戻った頃には平均が汚染されていて、
   // ゲートを通った瞬間に誤った方位を採用してしまう (実機で西を向く不具合の原因)。
-  const bool poseIsClean = compass::isMeasurementPose(yawDeci) && !servoLikelyMoving(nowMillis);
+  const bool poseIsClean =
+      compass::isMeasurementPose(yawDeci) && !servoLikelyMoving(nowMillis, yawDeci);
   if (!poseIsClean) {
     return;
   }
@@ -326,6 +347,10 @@ void saveLiveState(int actualYaw) {
   preferences.putInt("disp",
                      static_cast<int>(std::lround(g_headingFilter.dispersionDegrees() * 10.0F)));
   preferences.putInt("sinceStop", static_cast<int>(millis() - g_lastServoStopMillis));
+  // ジャイロの実測値。DeviceMoving で弾かれる場合、閾値が実機のノイズに
+  // 対して厳しすぎないかをこれで判断する。
+  preferences.putInt("nSamp", static_cast<int>(g_headingFilter.sampleCount()));
+  preferences.putInt("gyro", static_cast<int>(std::lround(readGyroMagnitude() * 10.0F)));
   // 指令値と実際の角度がずれていないかを見る。ゲートは指令値を信じて
   // 「測定姿勢かどうか」を判断しているので、ここがずれていると前提が崩れる。
   preferences.putInt("realYaw", actualYaw);
@@ -351,7 +376,19 @@ void drawStatus() {
   if (g_state.phase == app::Phase::Calibrating) {
     display.setTextColor(TFT_YELLOW, TFT_BLACK);
     display.setCursor(4, 60);
-    display.printf("rotate fig-8 %d%%  ", static_cast<int>(g_collector.coverage() * 100.0F));
+    display.printf("turn all ways %d%%  ", static_cast<int>(g_collector.coverage() * 100.0F));
+
+    // 水平 2 軸をどれだけ掃けたかを出す。方位は水平成分からしか出ないので、
+    // ここが伸びないと何度回しても採用されない。
+    const compass::Vec3 span = g_collector.axisSpan();
+    const float horizontal = std::fmin(span.x, span.y);
+    display.setTextColor(horizontal >= 45.0F ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+    display.setCursor(4, 90);
+    display.printf("horiz %2d/45 uT  ", static_cast<int>(horizontal));
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    display.setCursor(4, 120);
+    display.printf("x%2d y%2d z%2d    ", static_cast<int>(span.x), static_cast<int>(span.y),
+                   static_cast<int>(span.z));
     return;
   }
 
@@ -444,7 +481,7 @@ void loop() {
   // 測定ゲート。首が正面にあり、静止していて、値が安定しているときだけ採用する。
   compass::MeasurementGate::Input gateInput;
   gateInput.nowMillis = now;
-  gateInput.servoMoving = servoLikelyMoving(now);
+  gateInput.servoMoving = servoLikelyMoving(now, actualYaw);
   gateInput.lastServoStopMillis = g_lastServoStopMillis;
   gateInput.gyroMagnitudeDegPerSec = readGyroMagnitude();
   gateInput.fieldMagnitudeMicroTesla = compass::magnitude(readMag());
@@ -456,18 +493,31 @@ void loop() {
   // Why not 毎周期 lastCommand + settle で上書きする: ゲートはこの時刻から
   // さらに settleMillis 経つまで Settling を返す。毎周期書き換えると基準が
   // 動き続けて、首が止まっていても永久に Settling のままになる (実機で発生)。
+  //
+  // servoLikelyMoving() は角度が動かなくなってから 500ms の静穏を確かめた上で
+  // false を返す。つまりこの時点で磁場は既に落ち着いているので、ゲート側の
+  // settle をさらに課すと待ちが二重になる。停止時刻を settleMillis ぶん
+  // 遡らせて、ゲートの条件を即座に満たすようにする。
   static bool wasMoving = false;
   if (wasMoving && !gateInput.servoMoving) {
-    g_lastServoStopMillis = now;
+    g_lastServoStopMillis = now - g_config.servoSettleMillis;
   }
   wasMoving = gateInput.servoMoving;
+  gateInput.lastServoStopMillis = g_lastServoStopMillis;
 
   const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
   g_lastGateReject = reject;
-  // フィルタが空 (= 測定姿勢での有効なサンプルをまだ 1 つも取れていない) なら、
-  // ゲートを通っていても採用できない。
-  const bool accepted =
-      reject == compass::MeasurementGate::Reject::None && g_headingFilter.hasValue();
+  // フィルタが十分に溜まるまで採用しない。
+  //
+  // 指数移動平均は最初の数サンプルが初期値に引きずられるので、2-3 個で
+  // 判定すると収束前の値を掴む。実機ではこれで方位が ±40 度揺れた。
+  //
+  // 平滑化 0.5 なら 8 サンプルで初期値の影響は 0.5^8 = 0.4% まで落ちる。
+  // 実機の測定窓で取れるのは 11 個程度だったので、そこに収まる値にする。
+  // 16 を要求すると窓の中で到達できず、永久に採用されない。
+  constexpr std::size_t kMinimumSamples = 8;
+  const bool accepted = reject == compass::MeasurementGate::Reject::None &&
+                        g_headingFilter.hasConverged(kMinimumSamples);
   if (accepted) {
     g_bodyTrueHeading =
         compass::trueHeadingFromMagnetic(g_headingFilter.valueDegrees(), kSiteDeclinationEast);

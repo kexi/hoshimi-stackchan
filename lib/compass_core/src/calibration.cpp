@@ -57,14 +57,24 @@ float CalibrationCollector::coverage() const {
     return 0.0F;
   }
 
-  // サンプル数と、3 軸それぞれのレンジ充足率のうち最も低いものを進捗とする。
-  // 一番遅れている条件を見せた方が「あと何をすればよいか」が伝わる。
+  // 採用条件のうち最も遅れているものを進捗とする。100% になったのに
+  // finish() が弾く、という食い違いが起きないよう、条件を揃えておく。
   const float sampleProgress = static_cast<float>(count_) / static_cast<float>(config_.minSamples);
   const float rangeProgress =
       std::min({axisRange(min_.x, max_.x), axisRange(min_.y, max_.y), axisRange(min_.z, max_.z)}) /
       config_.minAxisRangeMicroTesla;
+  // 方位は水平成分からしか出ないので、ここが本命の条件
+  const float horizontalProgress = std::min(axisRange(min_.x, max_.x), axisRange(min_.y, max_.y)) /
+                                   config_.minFieldDiameterMicroTesla;
 
-  return std::min(1.0F, std::min(sampleProgress, rangeProgress));
+  return std::min(1.0F, std::min({sampleProgress, rangeProgress, horizontalProgress}));
+}
+
+Vec3 CalibrationCollector::axisSpan() const {
+  if (!hasSample_) {
+    return Vec3{};
+  }
+  return Vec3{axisRange(min_.x, max_.x), axisRange(min_.y, max_.y), axisRange(min_.z, max_.z)};
 }
 
 MagCalibration CalibrationCollector::finish() const {
@@ -81,6 +91,20 @@ MagCalibration CalibrationCollector::finish() const {
 
   // 回し足りない軸があるまま採用すると、その軸のスケールが暴れて方位が破綻する。
   if (smallestRange < config_.minAxisRangeMicroTesla) {
+    return calibration;
+  }
+
+  // 各軸のレンジは、地磁気の全磁力の 2 倍近くあるはず (一回転すれば ±|B| を
+  // 掃くため)。これを大きく下回るなら回し方が足りておらず、min/max の中心が
+  // 「回した範囲の中心」に寄る。すると補正後の水平成分がほぼゼロになり、
+  // atan2 がノイズを拾って方位が全方位に散らばる (実機で発生)。
+  //
+  // 見るのは水平 2 軸 (X, Y) の直径。方位は水平成分から atan2 で出すので、
+  // Z がいくら大きくても方位の精度には寄与しない。実機では 3 軸平均だと
+  // Z に助けられて通ってしまい、水平成分が 18uT (地磁気の 6 割) しかない
+  // キャリブレーションが採用された。
+  const float horizontalDiameter = std::min(rangeX, rangeY);
+  if (horizontalDiameter < config_.minFieldDiameterMicroTesla) {
     return calibration;
   }
   if (smallestRange <= 0.0F || largestRange / smallestRange > config_.maxAxisRangeRatio) {

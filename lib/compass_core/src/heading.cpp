@@ -52,12 +52,21 @@ void HeadingFilter::reset() {
   sumSin_ = 0.0F;
   sumCos_ = 0.0F;
   hasValue_ = false;
+  sampleCount_ = 0;
+}
+
+std::size_t HeadingFilter::sampleCount() const { return sampleCount_; }
+
+bool HeadingFilter::hasConverged(std::size_t minimumSamples) const {
+  return hasValue_ && sampleCount_ >= minimumSamples;
 }
 
 void HeadingFilter::update(float headingDegrees) {
   const float radians = headingDegrees * kDeg2Rad;
   const float sinValue = std::sin(radians);
   const float cosValue = std::cos(radians);
+
+  ++sampleCount_;
 
   if (!hasValue_) {
     sumSin_ = sinValue;
