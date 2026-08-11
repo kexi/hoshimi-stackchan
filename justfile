@@ -45,6 +45,22 @@ monitor:
     fi
     pio device monitor --project-dir firmware --port "$port"
 
+# 実機の計測結果を NVS から回収する。
+# この個体は USB CDC シリアルが列挙されないため、ファームは結果を NVS に書き、
+# ここでフラッシュごと吸い出して読む (シリアルに頼らずログが取れる)
+read-nvs filter='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    port=$(pio device list --json-output \
+      | python3 -c 'import json,sys; print(next((d["port"] for d in json.load(sys.stdin) if "303A:1001" in (d.get("hwid") or "")), ""))')
+    if [ -z "$port" ]; then
+      echo "CoreS3 が見つかりません (hwid 303A:1001)" >&2
+      exit 1
+    fi
+    PYTHONPATH="$PLATFORMIO_CORE_DIR/packages/tool-esptoolpy:${PYTHONPATH:-}" \
+      python3 scripts/read_nvs.py "$port" \
+      "$PLATFORMIO_CORE_DIR/packages/tool-esptoolpy/esptool.py" {{ filter }}
+
 clean:
     pio run --project-dir firmware --target clean
     rm -rf build

@@ -12,6 +12,7 @@
 
 #include <M5StackChan.h>
 #include <M5Unified.h>
+#include <Preferences.h>
 
 #include "pointing/servo_map.hpp"
 
@@ -27,10 +28,44 @@ constexpr int kMoveSpeed = 400;
 
 int g_lineY = 0;
 
+// 計測結果は NVS に残す。USB シリアルが使えない状況でも、次回起動時に
+// 読み出せば結果を回収できる (画面を人が読んで伝える必要がなくなる)。
+constexpr const char* kResultNamespace = "stage6";
+
+void saveResult(const char* key, int value) {
+  Preferences preferences;
+  if (!preferences.begin(kResultNamespace, false)) {
+    return;
+  }
+  preferences.putInt(key, value);
+  preferences.end();
+}
+
+// 前回の結果を画面に出す。書き込み直後の起動では前回値が、
+// 2 回目以降の起動では今回の値が読める。
+void showPreviousResults() {
+  Preferences preferences;
+  if (!preferences.begin(kResultNamespace, true)) {
+    return;
+  }
+  const int pitchMax = preferences.getInt("pitchMax", -1);
+  const int yawMax = preferences.getInt("yawMax", -1);
+  const int yawMin = preferences.getInt("yawMin", -1);
+  const int holdDrift = preferences.getInt("holdDrift", -1);
+  preferences.end();
+
+  if (pitchMax < 0) {
+    return;
+  }
+  auto& display = M5.Display;
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(4, display.height() - 18);
+  display.printf("prev p%d y%d/%d d%d", pitchMax, yawMin, yawMax, holdDrift);
+}
+
 // LCD とシリアルの両方に出す。どちらか一方しか見えない状況でも追える。
 void trace(const char* message) {
   Serial.println(message);
-  Serial.flush();
 
   auto& display = M5.Display;
   if (g_lineY > display.height() - 16) {
@@ -59,9 +94,9 @@ void moveAndReport(const char* label, int yawDeci, int pitchDeci) {
 } // namespace
 
 void setup() {
-  // M5StackChan.begin() は内部で M5.begin() を呼ぶが、そこまで到達せずに
-  // 落ちている可能性を切り分けたいので、先に表示だけ自前で起こす。
-  // 二重初期化にならないよう、ここでは M5.begin() は呼ばない。
+  // BSP の begin() が内部で M5.begin() を呼ぶ。ここで先に M5.begin() を
+  // 済ませておくのは、BSP 初期化中の進捗を画面に出したいため。
+  // M5Unified の begin() は二重に呼んでも安全。
   auto config = M5.config();
   M5.begin(config);
 
@@ -70,7 +105,9 @@ void setup() {
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 
-  Serial.begin(115200);
+  // Why not Serial.begin(): CoreS3 は ARDUINO_USB_CDC_ON_BOOT=1 なので
+  // Serial は起動時点で USB CDC として既に開いている。後から begin() を
+  // 呼ぶと CDC の列挙が壊れ、ホストから一切データが見えなくなる (実機で確認)。
 
   trace("boot ok");
   trace("bsp begin...");
@@ -99,31 +136,64 @@ void setup() {
   moveAndReport("pitMax", 0, pointing::kPitchMaxDeci);
 
   const int reachedPitch = M5StackChan.Motion.getCurrentPitchAngle();
-  const bool pitchReachesTop = reachedPitch >= pointing::kPitchMaxDeci - 50;
-  char verdict[96];
-  std::snprintf(verdict, sizeof(verdict), "pitch top: %s (%d)", pitchReachesTop ? "YES" : "NO",
-                reachedPitch);
-  trace(verdict);
-  if (!pitchReachesTop) {
-    // NVS の zero_pos_2 が上端側に寄っていると raw が 1000 で頭打ちになる。
-    // その場合は setCurrentPostionAsHome() で原点を取り直す必要がある。
-    trace("check NVS zero_pos_2");
-  }
+  saveResult("pitchMax", reachedPitch);
 
-  moveAndReport("pitLvl", 0, pointing::kPitchLevelDeci);
-  trace("=== done ===");
+  // yaw の到達値も取る。両端に振ってから中央に戻し、端の値を覚えておく。
+  M5StackChan.Motion.move(pointing::kYawMaxDeci, pointing::kPitchLevelDeci, kMoveSpeed);
+  delay(kSettleMillis);
+  const int reachedYawMax = M5StackChan.Motion.getCurrentYawAngle();
+  saveResult("yawMax", reachedYawMax);
+
+  M5StackChan.Motion.move(pointing::kYawMinDeci, pointing::kPitchLevelDeci, kMoveSpeed);
+  delay(kSettleMillis);
+  saveResult("yawMin", M5StackChan.Motion.getCurrentYawAngle());
+
+  M5StackChan.Motion.move(0, pointing::kPitchLevelDeci, kMoveSpeed);
+  delay(kSettleMillis);
+
+  // トルク保持の確認: 指令を出さずに 5 秒放置し、角度がどれだけ動くかを測る。
+  // setAutoTorqueReleaseEnabled(false) が効いていれば、ほぼ 0 のはず。
+  const int holdStartPitch = M5StackChan.Motion.getCurrentPitchAngle();
+  delay(5000);
+  const int holdDrift = M5StackChan.Motion.getCurrentPitchAngle() - holdStartPitch;
+  saveResult("holdDrift", holdDrift);
+
+  // 結論は流さずに固定表示する。スクロールで消えると読めないため。
+  const bool pitchReachesTop = reachedPitch >= pointing::kPitchMaxDeci - 50;
+  auto& display = M5.Display;
+  display.fillScreen(TFT_BLACK);
+  display.setTextSize(2);
+  display.setTextColor(pitchReachesTop ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+  display.setCursor(4, 4);
+  display.printf("pitch max: %d", reachedPitch);
+  display.setCursor(4, 30);
+  display.printf("want>=%d %s", pointing::kPitchMaxDeci - 50, pitchReachesTop ? "OK" : "SHORT");
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.setCursor(4, 60);
+  display.printf("yaw max:   %d", reachedYawMax);
+  display.setCursor(4, 86);
+  display.printf("want>=%d", pointing::kYawMaxDeci - 50);
+  display.setTextColor(holdDrift > -30 && holdDrift < 30 ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  display.setCursor(4, 116);
+  display.printf("hold drift: %d", holdDrift);
+
+  showPreviousResults();
 }
 
 void loop() {
   M5StackChan.update();
 
-  // トルク保持が効いているか (首が垂れないか) を目視で確認できるよう、
-  // 10 秒ごとに現在角度を出し続ける。
+  // トルク保持が効いているか (首が垂れないか) を数値で確認する。
+  // 画面下部を上書きし続けるので、値が動かなければ保持できている。
   static std::uint32_t lastReportMillis = 0;
   const std::uint32_t now = millis();
-  if (now - lastReportMillis >= 10000) {
+  if (now - lastReportMillis >= 1000) {
     lastReportMillis = now;
-    traceAngles("hold");
+    auto& display = M5.Display;
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setCursor(4, 146);
+    display.printf("now y=%5d p=%4d ", M5StackChan.Motion.getCurrentYawAngle(),
+                   M5StackChan.Motion.getCurrentPitchAngle());
   }
 
   delay(10);
