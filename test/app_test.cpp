@@ -308,6 +308,21 @@ void testMeasurementPoseIsCommanded() {
   CHECK_TRUE(tracking.pitchDeciDegrees == state.lastSolve.command.pitchDeciDegrees);
 }
 
+void testPointingDoesNotReissueCommandForever() {
+  // Pointing で毎周期 shouldMove が真だと、指令が出し直され続けて
+  // サーボ静止の判定が真に戻り、局面から抜けられなくなる (実機で発生)。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+
+  advanceUntil(state, app::Phase::Pointing, clock, config);
+  CHECK_TRUE(state.phase == app::Phase::Pointing);
+
+  // 目標に着いていて deadband 内なら、動かす必要はない
+  const app::ServoIntent intent = app::servoIntentFor(state);
+  CHECK_TRUE(intent.shouldMove == state.lastSolve.shouldMove);
+}
+
 void testMeasurePoseSettleOutlastsServoTravel() {
   // 既定値の関係が崩れると、首がまだ動いている最中に Measuring へ進んでしまう。
   // するとゲートが servoMoving で弾き続け、タイムアウト後に汚れた方位が
@@ -341,6 +356,7 @@ void testMeasurePoseSettleIsRespected() {
 
 int main() {
   testMeasurementPoseIsCommanded();
+  testPointingDoesNotReissueCommandForever();
   testMeasurePoseSettleOutlastsServoTravel();
   testMeasurePoseSettleIsRespected();
   testBootReachesTracking();

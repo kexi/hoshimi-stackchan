@@ -582,6 +582,13 @@ void loop() {
       // Pointing に入ってからの経過。抜けない理由の切り分け用。
       probe.putInt("inPhase", static_cast<int>(millis() - g_state.phaseEnteredMillis));
       probe.putInt("settled", g_lastTickServoSettled ? 1 : 0);
+      // 首が実際に指している方位 = 機体の向き + 首の相対角。
+      // 真北を指せているかを、目視でなく数値で検証する。
+      const float neckAbsolute =
+          g_bodyTrueHeading + static_cast<float>(currentYawDeci(millis())) / 10.0F;
+      probe.putInt("neckAbs", static_cast<int>(std::lround(neckAbsolute * 10.0F)));
+      probe.putInt("tgtAz", static_cast<int>(std::lround(
+                                g_state.lastPosition.horizontal.azimuthDegrees * 10.0F)));
       probe.putInt("lvCov", static_cast<int>(std::lround(g_calibrationCoverage * 100.0F)));
       // 傾き判定に使っている値。閾値が実機に対して妥当かを見る。
       const compass::Vec3 accelProbe = readAccel();

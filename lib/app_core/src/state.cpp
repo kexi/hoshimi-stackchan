@@ -105,8 +105,13 @@ ServoIntent servoIntentFor(const State& state) {
 
   intent.yawDeciDegrees = state.lastSolve.command.yawDeciDegrees;
   intent.pitchDeciDegrees = state.lastSolve.command.pitchDeciDegrees;
-  // Pointing に入った直後は必ず動かす。Tracking 中は deadband を尊重する。
-  intent.shouldMove = state.phase == Phase::Pointing || state.lastSolve.shouldMove;
+  // Pointing で無条件に真を返さない。
+  //
+  // Why not Pointing なら常に動かす: 呼び出し側は毎周期この関数を呼ぶ。
+  // 常に真だと指令が出し直され続け、サーボ静止の判定が真に戻り続けて
+  // Pointing から抜けられなくなる (実機で発生)。指令は局面に入った時点で
+  // 出ているので、あとは deadband の判断に任せる。
+  intent.shouldMove = state.lastSolve.shouldMove;
   return intent;
 }
 
