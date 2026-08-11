@@ -221,9 +221,48 @@ void testMovingServoNeverContributes() {
   CHECK_TRUE(!pipeline.headingValid());
 }
 
+void testMeasureWindowAccumulatesEnoughSamples() {
+  // 実機で hdgOk が立たなかった原因の再現。
+  //
+  // 測定窓 8 秒、BMM150 は 24Hz なので理論上 192 サンプル取れるはずが、
+  // 実機では 6 個で止まっていた。窓が実質 250ms しかない計算になる。
+  //
+  // 原因は Measuring 中も毎周期 commandServo() が呼ばれ、そのたびに
+  // サーボ動作中フラグが立ち直してフィルタが溜まらないこと。
+  // 測定窓の間は指令を出し直さないこと、を保証する。
+  constexpr float kMagPeriodMillis = 1000.0F / 24.0F;
+  constexpr std::uint32_t kMeasureWindowMillis = 8000;
+  constexpr std::size_t kMinimumSamples = 8;
+
+  HeadingPipeline pipeline;
+  HeadingPipeline::Sample sample;
+  sample.mag = fieldForHeading(0.0F);
+  sample.commandedYaw = 0;
+
+  // 測定窓のあいだ、mag の更新周期でサンプルを入れる
+  std::size_t ingested = 0;
+  for (std::uint32_t elapsed = 0; elapsed < kMeasureWindowMillis;
+       elapsed += static_cast<std::uint32_t>(kMagPeriodMillis)) {
+    sample.nowMillis = 10000 + elapsed;
+    pipeline.ingest(sample);
+    pipeline.evaluate(sample);
+    ++ingested;
+  }
+
+  // 窓の中で十分なサンプルが入ること
+  CHECK_TRUE(ingested >= kMinimumSamples);
+  CHECK_TRUE(pipeline.headingValid());
+  CHECK_NEAR_ANGLE(pipeline.bodyTrueHeading(), 352.1, 0.5);
+
+  // 8 サンプルに必要な時間は 333ms 程度。窓 8 秒に対して十分短い。
+  const float millisFor8 = kMagPeriodMillis * static_cast<float>(kMinimumSamples);
+  CHECK_TRUE(millisFor8 < static_cast<float>(kMeasureWindowMillis));
+}
+
 } // namespace
 
 int main() {
+  testMeasureWindowAccumulatesEnoughSamples();
   testCleanPoseProducesCorrectHeading();
   testTurnedPoseIsIgnoredEntirely();
   testReturnToPoseRecoversCleanHeading();

@@ -26,6 +26,7 @@ add_library(
   lib/compass_core/src/calibration.cpp
   lib/compass_core/src/heading.cpp
   lib/compass_core/src/declination.cpp
+  lib/compass_core/src/sphere_fit.cpp
   lib/compass_core/src/stability.cpp)
 target_include_directories(compass_core PUBLIC lib/compass_core/include)
 target_compile_options(compass_core PRIVATE ${COMPASS_WARNINGS})
@@ -64,6 +65,12 @@ if(BUILD_TESTING)
   target_include_directories(heading-pipeline-test PRIVATE test)
   target_compile_options(heading-pipeline-test PRIVATE ${COMPASS_WARNINGS})
   add_test(NAME heading-pipeline-test COMMAND heading-pipeline-test)
+
+  add_executable(sphere-fit-test test/sphere_fit_test.cpp)
+  target_link_libraries(sphere-fit-test PRIVATE compass_core)
+  target_include_directories(sphere-fit-test PRIVATE test)
+  target_compile_options(sphere-fit-test PRIVATE ${COMPASS_WARNINGS})
+  add_test(NAME sphere-fit-test COMMAND sphere-fit-test)
 
   add_executable(app-test test/app_test.cpp)
   target_link_libraries(app-test PRIVATE app_core)

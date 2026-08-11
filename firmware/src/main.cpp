@@ -6,6 +6,10 @@
 // 磁気測定は必ず首を正面に戻してから行う。首の角度によって方位が最大 119 度
 // ずれることを実機で確認しているため (段階 8)。ロジックは app_core 側にあり、
 // ここは実機の入出力を state machine に橋渡しするだけ。
+//
+// 診断用の NVS 書き込みは意図的に置いていない。デバッグのために毎周期
+// フラッシュへ書き、球の当てはめを回していたところ、それ自体がウォッチドッグを
+// 踏んで 4 秒ごとに再起動していた。状態は画面に出せば足りる。
 
 #include <M5StackChan.h>
 #include <M5Unified.h>
@@ -16,13 +20,12 @@
 #include "compass/calibration.hpp"
 #include "compass/declination.hpp"
 #include "compass/heading.hpp"
+#include "compass/sphere_fit.hpp"
 #include "compass/stability.hpp"
 #include "location_config.h"
 
 #include <cmath>
-#include <cstdarg>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -38,30 +41,41 @@
 namespace {
 
 constexpr const char* kCalibrationNamespace = "magcal";
-// 動作中の内部状態を残す。USB シリアルが使えないので、ずれの原因を
-// 切り分けるにはこれを読むしかない。
-constexpr const char* kDebugNamespace = "live";
 constexpr int kMoveSpeed = 400;
 constexpr std::uint32_t kWifiTimeoutMillis = 20000;
+
+// キャリブレーションのサンプルを全点保持して球に当てはめる。
+//
+// Why not min/max: 各軸の端に到達した 2 点しか使わないので、端まで回しきらないと
+// 中心が「回した範囲の中心」に寄る。実機ではそれで補正後の水平成分が地磁気の
+// 6 割になり、方位が全方位に散らばった。最小二乗なら球面の一部さえ掃ければ
+// 中心が求まるので、短い回転で済む。
+constexpr std::size_t kCalibrationCapacity = 512;
+constexpr std::size_t kMinCalibrationSamples = 120;
+constexpr float kMinFieldRadiusMicroTesla = 20.0F;
+// 補正後に球へどれだけ乗っていれば採用するか。実機のハードアイアンは地磁気の
+// 6 倍あり歪みが強いので、厳しくしすぎると永久に採用されない。
+constexpr float kMaxCalibrationResidual = 0.25F;
+// 当てはめは数百点の最小二乗で重い。毎周期回すとウォッチドッグを踏む。
+constexpr std::uint32_t kFitIntervalMillis = 2000;
 
 app::State g_state;
 app::Config g_config;
 astro::Observer g_observer;
 
 compass::MagCalibration g_calibration;
+// 3x3 のソフトアイアン補正。実機の歪みは対角では直せず、方位が 32 度ずれた。
+compass::EllipsoidFit g_ellipsoid;
 compass::MeasurementGate g_gate;
-// 平滑化を強めにするのは、測定のたびにフィルタが空から始まるため。
-// 弱いと 5 秒の測定窓では収束しきらず、ばらつきが大きいまま棄却され続ける。
-// BMM150 は 24Hz なので、0.5 なら 10 サンプル (0.4 秒) でほぼ収まる。
 compass::HeadingFilter g_headingFilter{0.5F};
-compass::CalibrationCollector g_collector;
+
+compass::Vec3* g_calibrationSamples = nullptr;
+std::size_t g_calibrationCount = 0;
 
 bool g_timeValid = false;
 bool g_headingValid = false;
 float g_bodyTrueHeading = 0.0F;
 
-// 自前で持つサーボの動作状態。BSP の isMoving() は実サーボへ UART 問い合わせ
-// するのでコストが高く、毎周期は呼べない。
 std::uint32_t g_lastServoCommandMillis = 0;
 std::uint32_t g_lastServoStopMillis = 0;
 int g_commandedYaw = 0;
@@ -121,6 +135,29 @@ void saveCalibration(const compass::MagCalibration& calibration) {
   preferences.end();
 }
 
+// 3x3 補正を NVS に入れる。行列は 9 要素あるので blob で扱う。
+void saveEllipsoid(const compass::EllipsoidFit& fit) {
+  Preferences preferences;
+  if (!preferences.begin("ellip", false)) {
+    return;
+  }
+  preferences.putBytes("fit", &fit, sizeof(fit));
+  preferences.end();
+}
+
+void loadEllipsoid() {
+  Preferences preferences;
+  if (!preferences.begin("ellip", true)) {
+    return;
+  }
+  compass::EllipsoidFit stored;
+  if (preferences.getBytesLength("fit") == sizeof(stored)) {
+    preferences.getBytes("fit", &stored, sizeof(stored));
+    g_ellipsoid = stored;
+  }
+  preferences.end();
+}
+
 // Wi-Fi と NTP。失敗しても続行する。真北は時計が無くても指せる。
 void syncTime() {
   if (std::strlen(WIFI_SSID) == 0) {
@@ -146,48 +183,30 @@ void syncTime() {
   }
 }
 
-// サーボへ指令を出す。動作中の推定にも使う。
-void commandServo(int yawDeci, int pitchDeci, int actualYaw) {
-  // 同じ指令の繰り返しは弾く。ただし首が実際にそこにいる場合に限る。
-  //
-  // Why not 指令値の一致だけで判断する: 起動直後は g_commandedYaw が 0 で、
-  // 測定姿勢の指令 (yaw=0) と一致してしまう。すると move() が一度も呼ばれず、
-  // 首は電源投入時の角度に居座ったまま「正面にいるはず」と扱われる。
-  // 実機ではこれで ReturningToMeasurePose から抜けられなくなった。
-  const bool alreadyThere = std::abs(actualYaw - yawDeci) <= compass::kMeasurementYawToleranceDeci;
-  const bool unchanged = yawDeci == g_commandedYaw && pitchDeci == g_commandedPitch;
-  if (unchanged && alreadyThere) {
-    return;
-  }
-  // 測定姿勢から離れるなら、溜めた方位を捨てる。首が動いた後に古い平均が
-  // 残っていると、次に正面へ戻ったとき汚れた値が即座に採用されてしまう。
-  const bool leavingMeasurePose = !compass::isMeasurementPose(yawDeci);
-  if (leavingMeasurePose) {
-    g_headingFilter.reset();
-    // 方位も無効に戻す。首が動いた後も古い値を「有効」と見なしていると、
-    // 次の Measuring がその場で成立してしまい、測り直しの意味がなくなる。
-    g_headingValid = false;
-  }
+// 実際の首の角度。UART 越しなのでコストが高く、間隔を空けて読む。
+//
+// Why not 指令値: Tracking 中は deadband 内なら move() を呼ばないので、
+// 指令値は古い角度のまま取り残される。ゲートが姿勢を誤判定して測定を弾く。
+int currentYawDeci(std::uint32_t nowMillis) {
+  static int cachedYaw = 0;
+  static std::uint32_t lastReadMillis = 0;
+  constexpr std::uint32_t kReadIntervalMillis = 200;
 
-  g_commandedYaw = yawDeci;
-  g_commandedPitch = pitchDeci;
-  g_lastServoCommandMillis = millis();
-  M5StackChan.Motion.move(yawDeci, pitchDeci, kMoveSpeed);
+  if (nowMillis - lastReadMillis >= kReadIntervalMillis) {
+    lastReadMillis = nowMillis;
+    cachedYaw = M5StackChan.Motion.getCurrentYawAngle();
+  }
+  return cachedYaw;
 }
 
 // 首が動いているかを、実際の角度の変化で判定する。
 //
-// Why not 指令からの経過時間だけを見る: 指令を出すたびに一定時間を無条件で
-// 「動作中」とすると、首が既に目標にいて動く必要がない場合まで動作中と
-// 扱われる。ゲートが ServoMoving を返し続け、磁気が一切採用されない
-// (実機でフィルタが空のままだった原因)。
-//
-// 角度が動いていないことを確かめてから、さらに settle 時間だけ待つ。
+// Why not 指令からの経過時間: 指令のたび一定時間を無条件で動作中とすると、
+// 首が既に目標にいる場合まで動作中扱いになり、磁気が一切採用されない。
 bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
   static int lastYaw = 0;
   static std::uint32_t lastChangeMillis = 0;
 
-  // サーボの分解能は 3.125 deci-degree。これ以下の差は測定ノイズとみなす。
   constexpr int kMovementThresholdDeci = 5;
   if (std::abs(actualYaw - lastYaw) > kMovementThresholdDeci) {
     lastYaw = actualYaw;
@@ -200,26 +219,40 @@ bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
   return nowMillis - lastChangeMillis < kQuietMillis;
 }
 
-// 測定姿勢の判定に使う首の角度。
+// サーボへ指令を出す。
 //
-// Why not g_commandedYaw: 指令値は「最後に move() を呼んだときの値」でしかない。
-// Tracking 中は deadband 内なら move() を呼ばないので、状態機械が正面を指示して
-// 首が実際に正面へ戻っていても、指令値は古い角度のまま取り残される。
-// その結果ゲートが NotMeasurementPose を返し続け、正しい測定を弾いてしまう
-// (実機で首が北を向かなかった原因)。実際の角度を読むのが唯一確実。
-//
-// ScsServo::getCurrentAngle() は実サーボへの UART 問い合わせでコストが高いので、
-// 毎周期ではなく間隔を空けて読む。
-int currentYawDeci(std::uint32_t nowMillis) {
-  static int cachedYaw = 0;
-  static std::uint32_t lastReadMillis = 0;
-  constexpr std::uint32_t kReadIntervalMillis = 200;
-
-  if (nowMillis - lastReadMillis >= kReadIntervalMillis) {
-    lastReadMillis = nowMillis;
-    cachedYaw = M5StackChan.Motion.getCurrentYawAngle();
+// 首が既に目標にいて、かつ前回と同じ指令なら何もしない。両方を見るのは、
+// 指令値だけだと起動直後 (g_commandedYaw = 0) に測定姿勢の指令と一致して
+// move() が一度も出ず、到達済みだけだと次に動かすべき角度を見逃すため。
+// 同じ指令の再発行は servoLikelyMoving() を真に戻し、フィルタが溜まらなくなる。
+void commandServo(int yawDeci, int pitchDeci, int actualYaw) {
+  const bool alreadyThere = std::abs(actualYaw - yawDeci) <= compass::kMeasurementYawToleranceDeci;
+  const bool unchanged = yawDeci == g_commandedYaw && pitchDeci == g_commandedPitch;
+  if (alreadyThere && unchanged) {
+    return;
   }
-  return cachedYaw;
+
+  // 測定姿勢から離れるなら、溜めた方位を捨てる。首が動いた後に古い平均が
+  // 残っていると、次に正面へ戻ったとき汚れた値が即座に採用されてしまう。
+  if (!compass::isMeasurementPose(yawDeci)) {
+    g_headingFilter.reset();
+    g_headingValid = false;
+  }
+
+  g_commandedYaw = yawDeci;
+  g_commandedPitch = pitchDeci;
+  g_lastServoCommandMillis = millis();
+  M5StackChan.Motion.move(yawDeci, pitchDeci, kMoveSpeed);
+}
+
+void applyServoIntent(const app::ServoIntent& intent, int actualYaw) {
+  static app::Phase lastPhase = app::Phase::Error;
+  const bool phaseChanged = g_state.phase != lastPhase;
+  lastPhase = g_state.phase;
+
+  if (intent.shouldMove || phaseChanged) {
+    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees, actualYaw);
+  }
 }
 
 app::Input readInput() {
@@ -235,53 +268,11 @@ app::Input readInput() {
   return app::Input::None;
 }
 
-// 測定サイクル 1 回ぶんの生データを NVS に貯める。
+// 磁気を 1 サンプル取り込む。
 //
-// 実機の値を見ては一箇所ずつ直す進め方では原因が絞れなかったので、
-// 実機で起きたことをそのままホストへ持ち込んで再現できるようにする。
-// 貯めるのは首が正面にあるときの磁気と、そのときのゲートの判定。
-constexpr int kTraceSlots = 24;
-int g_traceCount = 0;
-bool g_traceDone = false;
-compass::MeasurementGate::Reject g_lastGateReject = compass::MeasurementGate::Reject::None;
-
-void appendTrace(const compass::Vec3& raw, const compass::Vec3& accel, int yawDeci,
-                 float headingDegrees, float dispersionDegrees, int rejectCode) {
-  // 一巡したら先頭へ戻る。1 回きりだと最初の測定サイクルしか見えず、
-  // その後どう変化したかが追えない。
-  if (g_traceCount >= kTraceSlots) {
-    g_traceCount = 0;
-  }
-
-  Preferences preferences;
-  if (!preferences.begin("trace", false)) {
-    return;
-  }
-  char key[16];
-  const int slot = g_traceCount++;
-  std::snprintf(key, sizeof(key), "mx%d", slot);
-  preferences.putInt(key, static_cast<int>(std::lround(raw.x * 10.0F)));
-  std::snprintf(key, sizeof(key), "my%d", slot);
-  preferences.putInt(key, static_cast<int>(std::lround(raw.y * 10.0F)));
-  std::snprintf(key, sizeof(key), "mz%d", slot);
-  preferences.putInt(key, static_cast<int>(std::lround(raw.z * 10.0F)));
-  std::snprintf(key, sizeof(key), "az%d", slot);
-  preferences.putInt(key, static_cast<int>(std::lround(accel.z * 100.0F)));
-  std::snprintf(key, sizeof(key), "yw%d", slot);
-  preferences.putInt(key, yawDeci);
-  std::snprintf(key, sizeof(key), "hd%d", slot);
-  preferences.putInt(key, static_cast<int>(std::lround(headingDegrees * 10.0F)));
-  std::snprintf(key, sizeof(key), "dp%d", slot);
-  preferences.putInt(key, static_cast<int>(std::lround(dispersionDegrees * 10.0F)));
-  std::snprintf(key, sizeof(key), "rj%d", slot);
-  preferences.putInt(key, rejectCode);
-  preferences.putInt("count", g_traceCount);
-  preferences.end();
-}
-
-// 磁気を 1 サンプル取り込む。新しい値が来ていなければ何もしない。
-// yawDeci は loop() が読んだ実際の首の角度。ここで読み直すと UART を
-// 二重に叩くことになるので受け取る。
+// 首が正面にないときの値はフィルタに入れない。ゲートは「採用するか」しか
+// 見ないので、首を振っている間の値を溜めると、正面に戻った頃には平均が
+// 汚染されていて、ゲートを通った瞬間に誤った方位を採用してしまう。
 void updateHeading(int yawDeci, std::uint32_t nowMillis) {
   if ((M5.Imu.update() & m5::IMU_Class::sensor_mask_mag) == 0) {
     return;
@@ -289,76 +280,58 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
 
   const compass::Vec3 raw = readMag();
   if (g_state.phase == app::Phase::Calibrating) {
-    g_collector.addSample(raw);
+    if (g_calibrationSamples != nullptr && g_calibrationCount < kCalibrationCapacity) {
+      g_calibrationSamples[g_calibrationCount++] = raw;
+    }
     return;
   }
 
-  // 首が正面にないときの値をフィルタに入れてはいけない。
-  // ゲートは「採用するか」を判断するだけで、フィルタの中身までは面倒を見ない。
-  // 首を振っている間の値を溜め込むと、正面に戻った頃には平均が汚染されていて、
-  // ゲートを通った瞬間に誤った方位を採用してしまう (実機で西を向く不具合の原因)。
   const bool poseIsClean =
       compass::isMeasurementPose(yawDeci) && !servoLikelyMoving(nowMillis, yawDeci);
   if (!poseIsClean) {
     return;
   }
 
-  const compass::Vec3 accel = readAccel();
-  const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
-  const compass::Attitude attitude = compass::attitudeFromAccel(accel);
-  const float magneticHeading = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
-  g_headingFilter.update(magneticHeading);
-
-  // 首が正面にある間の生データを貯める。ホストで同じ計算を再現するため。
-  appendTrace(raw, accel, yawDeci, magneticHeading, g_headingFilter.dispersionDegrees(),
-              static_cast<int>(g_state.lastReject));
-
+  // 3x3 が使えるならそちらを優先する。対角では実機の歪みを直しきれない。
+  const compass::Vec3 corrected = g_ellipsoid.valid ? compass::applyEllipsoid(g_ellipsoid, raw)
+                                                    : compass::applyCalibration(g_calibration, raw);
+  const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
+  g_headingFilter.update(compass::tiltCompensatedHeadingDegrees(corrected, attitude));
   g_gate.learnReferenceField(compass::magnitude(raw));
 }
 
-// 生の磁気・方位・指令を NVS に残す。ずれの原因 (軸か、偏角か、残差か) を
-// 切り分けるために、途中の値をすべて見えるようにしておく。
-void saveLiveState(int actualYaw) {
-  Preferences preferences;
-  if (!preferences.begin(kDebugNamespace, false)) {
+// キャリブレーションの完了判定。当てはめが重いので間隔を空けて呼ぶこと。
+void tryFinishCalibration() {
+  const compass::EllipsoidFit fit = compass::fitEllipsoid(g_calibrationSamples, g_calibrationCount);
+  if (!fit.valid || fit.meanRadius <= kMinFieldRadiusMicroTesla) {
     return;
   }
-  const compass::Vec3 raw = readMag();
-  const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
-  const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
+  if (fit.normalizedResidual >= kMaxCalibrationResidual) {
+    return;
+  }
 
-  preferences.putInt("rawX", static_cast<int>(std::lround(raw.x * 10.0F)));
-  preferences.putInt("rawY", static_cast<int>(std::lround(raw.y * 10.0F)));
-  preferences.putInt("rawZ", static_cast<int>(std::lround(raw.z * 10.0F)));
-  preferences.putInt("corX", static_cast<int>(std::lround(corrected.x * 10.0F)));
-  preferences.putInt("corY", static_cast<int>(std::lround(corrected.y * 10.0F)));
-  preferences.putInt("corZ", static_cast<int>(std::lround(corrected.z * 10.0F)));
-  preferences.putInt("magHdg",
-                     static_cast<int>(std::lround(
-                         compass::tiltCompensatedHeadingDegrees(corrected, attitude) * 10.0F)));
-  preferences.putInt("fltHdg",
-                     static_cast<int>(std::lround(g_headingFilter.valueDegrees() * 10.0F)));
-  preferences.putInt("trueHdg", static_cast<int>(std::lround(g_bodyTrueHeading * 10.0F)));
-  preferences.putInt("cmdYaw", g_commandedYaw);
-  // ゲートが何で弾いているかを、採用/棄却にかかわらず毎回残す。
-  // appendTrace は姿勢が綺麗なときしか呼ばれないので、棄却理由が見えない。
-  preferences.putInt("gateRej", static_cast<int>(g_lastGateReject));
-  preferences.putInt("filtN", g_headingFilter.hasValue() ? 1 : 0);
-  preferences.putInt("disp",
-                     static_cast<int>(std::lround(g_headingFilter.dispersionDegrees() * 10.0F)));
-  preferences.putInt("sinceStop", static_cast<int>(millis() - g_lastServoStopMillis));
-  // ジャイロの実測値。DeviceMoving で弾かれる場合、閾値が実機のノイズに
-  // 対して厳しすぎないかをこれで判断する。
-  preferences.putInt("nSamp", static_cast<int>(g_headingFilter.sampleCount()));
-  preferences.putInt("gyro", static_cast<int>(std::lround(readGyroMagnitude() * 10.0F)));
-  // 指令値と実際の角度がずれていないかを見る。ゲートは指令値を信じて
-  // 「測定姿勢かどうか」を判断しているので、ここがずれていると前提が崩れる。
-  preferences.putInt("realYaw", actualYaw);
-  preferences.putInt("intentYaw", app::servoIntentFor(g_state).yawDeciDegrees);
-  preferences.putInt("phase", static_cast<int>(g_state.phase));
-  preferences.putInt("reject", static_cast<int>(g_state.lastReject));
-  preferences.putInt("hdgOk", g_headingValid ? 1 : 0);
-  preferences.end();
+  g_ellipsoid = fit;
+  saveEllipsoid(fit);
+
+  // 対角側も埋めておく。3x3 が使えない経路 (古い保存など) の保険。
+  const compass::SphereFit sphere = compass::fitSphere(g_calibrationSamples, g_calibrationCount);
+  const compass::MagCalibration calibration =
+      compass::calibrationFromSphere(sphere, g_calibrationSamples, g_calibrationCount);
+  if (calibration.valid) {
+    g_calibration = calibration;
+    saveCalibration(calibration);
+  }
+  g_headingFilter.reset();
+}
+
+void drawCalibrating() {
+  auto& display = M5.Display;
+  const int percent = static_cast<int>(g_calibrationCount * 100 / kMinCalibrationSamples);
+  display.setTextColor(TFT_YELLOW, TFT_BLACK);
+  display.setCursor(4, 40);
+  display.print("turn all ways    ");
+  display.setCursor(4, 76);
+  display.printf("%d%%      ", percent > 100 ? 100 : percent);
 }
 
 void drawStatus() {
@@ -369,28 +342,14 @@ void drawStatus() {
   display.setCursor(4, 4);
   display.printf("%-9s      ", astro::targetName(g_state.target));
 
+  if (g_state.phase == app::Phase::Calibrating) {
+    drawCalibrating();
+    return;
+  }
+
   display.setTextColor(TFT_DARKGREY, TFT_BLACK);
   display.setCursor(4, 30);
   display.printf("%-14s", app::phaseName(g_state.phase));
-
-  if (g_state.phase == app::Phase::Calibrating) {
-    display.setTextColor(TFT_YELLOW, TFT_BLACK);
-    display.setCursor(4, 60);
-    display.printf("turn all ways %d%%  ", static_cast<int>(g_collector.coverage() * 100.0F));
-
-    // 水平 2 軸をどれだけ掃けたかを出す。方位は水平成分からしか出ないので、
-    // ここが伸びないと何度回しても採用されない。
-    const compass::Vec3 span = g_collector.axisSpan();
-    const float horizontal = std::fmin(span.x, span.y);
-    display.setTextColor(horizontal >= 45.0F ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-    display.setCursor(4, 90);
-    display.printf("horiz %2d/45 uT  ", static_cast<int>(horizontal));
-    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    display.setCursor(4, 120);
-    display.printf("x%2d y%2d z%2d    ", static_cast<int>(span.x), static_cast<int>(span.y),
-                   static_cast<int>(span.z));
-    return;
-  }
 
   if (!g_state.lastPosition.valid) {
     display.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -407,8 +366,7 @@ void drawStatus() {
   display.printf("alt %+5.1f     ",
                  static_cast<double>(g_state.lastPosition.horizontal.altitudeDegrees));
 
-  // 首が届いていないなら、そのことを伝える。黙って端に張り付くと
-  // 「指している」と誤解される。
+  // 首が届いていないなら伝える。黙って端に張り付くと指していると誤解される。
   display.setCursor(4, 116);
   if (g_state.lastSolve.command.clampedPitch) {
     display.setTextColor(TFT_ORANGE, TFT_BLACK);
@@ -425,7 +383,7 @@ void drawStatus() {
     display.print("pointing       ");
   }
 
-  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setTextColor(g_headingValid ? TFT_DARKGREY : TFT_RED, TFT_BLACK);
   display.setCursor(4, 146);
   display.printf("hdg %5.1f %s  ", static_cast<double>(g_bodyTrueHeading),
                  g_state.autoCycleEnabled ? "auto" : "    ");
@@ -443,19 +401,22 @@ void setup() {
   M5StackChan.begin();
   // 指した姿勢を保つために必須。既定では静止 200ms でトルクが切れて首が垂れる。
   M5StackChan.Motion.setAutoTorqueReleaseEnabled(false);
-  // 追尾中は高頻度で角度を更新するので、同期は切っておく。
   M5StackChan.Motion.setAutoAngleSyncEnabled(false);
 
   g_observer.latitudeDegrees = kSiteLatitudeDegrees;
   g_observer.longitudeEastDegrees = kSiteLongitudeEastDegrees;
 
+  // CoreS3 は 8MB の PSRAM を積んでいるので、サンプルを全点保持できる。
+  g_calibrationSamples =
+      static_cast<compass::Vec3*>(ps_malloc(kCalibrationCapacity * sizeof(compass::Vec3)));
+
   loadCalibration();
+  loadEllipsoid();
   syncTime();
 
-  // キャリブレーションが無ければ 8 の字回しから始める。
-  if (!g_calibration.valid) {
+  if (!g_ellipsoid.valid) {
     g_state.phase = app::Phase::Calibrating;
-    g_collector.reset();
+    g_calibrationCount = 0;
   }
 }
 
@@ -463,41 +424,28 @@ void loop() {
   M5StackChan.update();
   const std::uint32_t now = millis();
 
-  // 実際の首の角度は 1 周期に 1 回だけ読む (UART 越しなのでコストが高い)
   const int actualYaw = currentYawDeci(now);
-
   updateHeading(actualYaw, now);
 
-  // 8 の字回しの完了判定
-  if (g_state.phase == app::Phase::Calibrating && g_collector.coverage() >= 1.0F) {
-    const compass::MagCalibration calibration = g_collector.finish();
-    if (calibration.valid) {
-      g_calibration = calibration;
-      saveCalibration(calibration);
-      g_headingFilter.reset();
-    }
+  static std::uint32_t lastFitMillis = 0;
+  const bool shouldTryFit = g_state.phase == app::Phase::Calibrating &&
+                            g_calibrationCount >= kMinCalibrationSamples &&
+                            now - lastFitMillis >= kFitIntervalMillis;
+  if (shouldTryFit) {
+    lastFitMillis = now;
+    tryFinishCalibration();
   }
 
-  // 測定ゲート。首が正面にあり、静止していて、値が安定しているときだけ採用する。
   compass::MeasurementGate::Input gateInput;
   gateInput.nowMillis = now;
   gateInput.servoMoving = servoLikelyMoving(now, actualYaw);
-  gateInput.lastServoStopMillis = g_lastServoStopMillis;
   gateInput.gyroMagnitudeDegPerSec = readGyroMagnitude();
   gateInput.fieldMagnitudeMicroTesla = compass::magnitude(readMag());
   gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
   gateInput.yawDeciDegrees = actualYaw;
 
-  // 停止した瞬間を 1 回だけ記録する。
-  //
-  // Why not 毎周期 lastCommand + settle で上書きする: ゲートはこの時刻から
-  // さらに settleMillis 経つまで Settling を返す。毎周期書き換えると基準が
-  // 動き続けて、首が止まっていても永久に Settling のままになる (実機で発生)。
-  //
-  // servoLikelyMoving() は角度が動かなくなってから 500ms の静穏を確かめた上で
-  // false を返す。つまりこの時点で磁場は既に落ち着いているので、ゲート側の
-  // settle をさらに課すと待ちが二重になる。停止時刻を settleMillis ぶん
-  // 遡らせて、ゲートの条件を即座に満たすようにする。
+  // 停止した瞬間を 1 回だけ記録する。servoLikelyMoving() が静穏を確かめた上で
+  // false を返すので、ゲート側の settle をさらに課すと待ちが二重になる。
   static bool wasMoving = false;
   if (wasMoving && !gateInput.servoMoving) {
     g_lastServoStopMillis = now - g_config.servoSettleMillis;
@@ -505,20 +453,12 @@ void loop() {
   wasMoving = gateInput.servoMoving;
   gateInput.lastServoStopMillis = g_lastServoStopMillis;
 
-  const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
-  g_lastGateReject = reject;
-  // フィルタが十分に溜まるまで採用しない。
-  //
-  // 指数移動平均は最初の数サンプルが初期値に引きずられるので、2-3 個で
-  // 判定すると収束前の値を掴む。実機ではこれで方位が ±40 度揺れた。
-  //
-  // 平滑化 0.5 なら 8 サンプルで初期値の影響は 0.5^8 = 0.4% まで落ちる。
-  // 実機の測定窓で取れるのは 11 個程度だったので、そこに収まる値にする。
-  // 16 を要求すると窓の中で到達できず、永久に採用されない。
+  // 指数移動平均は最初の数サンプルが初期値に引きずられる。収束前の値を
+  // 採用すると方位が大きく揺れる。
   constexpr std::size_t kMinimumSamples = 8;
-  const bool accepted = reject == compass::MeasurementGate::Reject::None &&
-                        g_headingFilter.hasConverged(kMinimumSamples);
-  if (accepted) {
+  const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
+  if (reject == compass::MeasurementGate::Reject::None &&
+      g_headingFilter.hasConverged(kMinimumSamples)) {
     g_bodyTrueHeading =
         compass::trueHeadingFromMagnetic(g_headingFilter.valueDegrees(), kSiteDeclinationEast);
     g_headingValid = true;
@@ -528,47 +468,46 @@ void loop() {
   tick.nowMillis = now;
   tick.unixSeconds = static_cast<std::int64_t>(std::time(nullptr));
   tick.timeValid = g_timeValid;
-  tick.calibrationValid = g_calibration.valid;
+  tick.calibrationValid = g_ellipsoid.valid;
   tick.input = readInput();
   tick.bodyTrueHeadingDegrees = g_bodyTrueHeading;
   tick.headingValid = g_headingValid;
-  tick.measurementAccepted = accepted;
+  tick.measurementAccepted = reject == compass::MeasurementGate::Reject::None;
   tick.lastReject = reject;
   tick.gyroMagnitudeDegPerSec = gateInput.gyroMagnitudeDegPerSec;
   tick.servoSettled = !gateInput.servoMoving;
 
   app::step(g_state, tick, g_config, g_observer);
+  applyServoIntent(app::servoIntentFor(g_state), actualYaw);
 
-  // 局面が変わった瞬間だけ指令を出す。
-  //
-  // Why not 毎周期 commandServo() を呼ぶ: 同じ角度なら commandServo() 内で
-  // 早期リターンするとはいえ、局面が続く限り条件は成立し続ける。実機では
-  // これで UART が詰まってファームが応答しなくなった。
-  //
-  // Why not intent.shouldMove だけを見る: shouldMove は Tracking 中の
-  // 「天体が動いたぶんだけ追う」ための deadband 判定でしかない。測定のために
-  // 首を正面へ戻す局面でこれを尊重すると、指令が一度も出ないまま Measuring に
-  // 入り、首が前の角度に取り残されてゲートが弾き続ける (実機で発生)。
-  static app::Phase lastPhase = app::Phase::Error;
-  const bool phaseChanged = g_state.phase != lastPhase;
-  lastPhase = g_state.phase;
-
-  const app::ServoIntent intent = app::servoIntentFor(g_state);
-  if (intent.shouldMove || phaseChanged) {
-    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees, actualYaw);
+  // 進捗をホストから確認するための最小限の記録。
+  // 診断のために毎周期フラッシュへ書いていたら 4 秒ごとに再起動した。
+  // 30 秒に 1 回、値 1 つだけに留める。
+  static std::uint32_t lastProbeMillis = 0;
+  if (now - lastProbeMillis >= 30000) {
+    lastProbeMillis = now;
+    Preferences probe;
+    if (probe.begin("probe", false)) {
+      probe.putInt("calN", static_cast<int>(g_calibrationCount));
+      // 当てはめが採用されない理由を数値で見る。30 秒に 1 回だけなので軽い。
+      if (g_calibrationCount >= kMinCalibrationSamples) {
+        const compass::SphereFit fit = compass::fitSphere(g_calibrationSamples, g_calibrationCount);
+        probe.putInt("fitR", static_cast<int>(std::lround(fit.radius * 10.0F)));
+        const compass::MagCalibration candidate =
+            compass::calibrationFromSphere(fit, g_calibrationSamples, g_calibrationCount);
+        probe.putInt("res", static_cast<int>(std::lround(
+                                compass::residualAfterCalibration(candidate, g_calibrationSamples,
+                                                                  g_calibrationCount) *
+                                1000.0F)));
+      }
+      probe.end();
+    }
   }
 
   static std::uint32_t lastDraw = 0;
   if (now - lastDraw >= 200) {
     lastDraw = now;
     drawStatus();
-  }
-
-  // NVS への書き込みはフラッシュを消耗するので、頻度は抑える。
-  static std::uint32_t lastDebugSave = 0;
-  if (now - lastDebugSave >= 3000) {
-    lastDebugSave = now;
-    saveLiveState(actualYaw);
   }
 
   delay(10);
