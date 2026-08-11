@@ -70,6 +70,8 @@ const char* phaseName(Phase phase) {
     return "Calibrating";
   case Phase::Idle:
     return "Idle";
+  case Phase::ReturningToMeasurePose:
+    return "ToMeasurePose";
   case Phase::Measuring:
     return "Measuring";
   case Phase::Pointing:
@@ -80,6 +82,32 @@ const char* phaseName(Phase phase) {
     break;
   }
   return "Error";
+}
+
+ServoIntent servoIntentFor(const State& state) {
+  ServoIntent intent;
+
+  // 測定に関わる局面では、首を必ず正面へ。これがノイズ対策の本体。
+  const bool needsMeasurePose = state.phase == Phase::ReturningToMeasurePose ||
+                                state.phase == Phase::Measuring ||
+                                state.phase == Phase::Calibrating;
+  if (needsMeasurePose) {
+    intent.yawDeciDegrees = compass::kMeasurementYawDeci;
+    intent.pitchDeciDegrees = pointing::kPitchLevelDeci;
+    intent.shouldMove = true;
+    return intent;
+  }
+
+  const bool canPoint = state.phase == Phase::Pointing || state.phase == Phase::Tracking;
+  if (!canPoint || !state.hasSolve) {
+    return intent;
+  }
+
+  intent.yawDeciDegrees = state.lastSolve.command.yawDeciDegrees;
+  intent.pitchDeciDegrees = state.lastSolve.command.pitchDeciDegrees;
+  // Pointing に入った直後は必ず動かす。Tracking 中は deadband を尊重する。
+  intent.shouldMove = state.phase == Phase::Pointing || state.lastSolve.shouldMove;
+  return intent;
 }
 
 astro::Target nextTarget(astro::Target current) {
@@ -102,7 +130,7 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
   const bool isInteractive = state.phase == Phase::Idle || state.phase == Phase::Tracking ||
                              state.phase == Phase::Pointing;
   if (targetChanged && isInteractive) {
-    enterPhase(state, Phase::Measuring, tick.nowMillis);
+    enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
     return;
   }
 
@@ -129,8 +157,19 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     return;
 
   case Phase::Idle:
-    enterPhase(state, Phase::Measuring, tick.nowMillis);
+    enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
     return;
+
+  case Phase::ReturningToMeasurePose: {
+    // 首が正面に戻り、磁場が落ち着くまで待つ。ここを省くと首の角度による
+    // バイアス (実測で最大 119 度) がそのまま方位に乗る。
+    const bool settled =
+        elapsedSince(tick.nowMillis, state.phaseEnteredMillis) >= config.measurePoseSettleMillis;
+    if (settled) {
+      enterPhase(state, Phase::Measuring, tick.nowMillis);
+    }
+    return;
+  }
 
   case Phase::Measuring: {
     if (tick.measurementAccepted && tick.headingValid) {
@@ -168,7 +207,7 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     // 機体ごと動かされたら方位が変わっているので測り直す。
     const bool bodyMoved = tick.gyroMagnitudeDegPerSec > config.bodyMovedGyroDegPerSec;
     if (bodyMoved) {
-      enterPhase(state, Phase::Measuring, tick.nowMillis);
+      enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
     }
 
@@ -178,14 +217,14 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     if (shouldCycle) {
       state.target = nextTarget(state.target);
       state.lastTargetSwitchMillis = tick.nowMillis;
-      enterPhase(state, Phase::Measuring, tick.nowMillis);
+      enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
     }
 
     const bool shouldRemeasure =
         elapsedSince(tick.nowMillis, state.lastMeasureMillis) >= config.remeasureIntervalMillis;
     if (shouldRemeasure) {
-      enterPhase(state, Phase::Measuring, tick.nowMillis);
+      enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
     }
 

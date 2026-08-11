@@ -16,6 +16,9 @@ enum class Phase : std::uint8_t {
   SyncTime,
   Calibrating,
   Idle,
+  // 首を正面へ戻す。ここを挟まないと、首の角度によって方位が最大 119 度ずれる
+  // (段階 8 実測)。磁気測定の前提を揃えるための姿勢。
+  ReturningToMeasurePose,
   Measuring,
   Pointing,
   Tracking,
@@ -39,6 +42,9 @@ struct Config {
   std::uint32_t autoCycleIntervalMillis = 8000;
   // サーボ指令を出してから収束したとみなすまでの時間。
   std::uint32_t servoSettleMillis = 1200;
+  // 首を正面に戻してから磁気を測り始めるまでの待ち。実測の収束 300ms に
+  // 首の移動時間を足した値。
+  std::uint32_t measurePoseSettleMillis = 1000;
   // 測定に使うサンプル数と、諦めるまでの時間。
   std::uint32_t measureTimeoutMillis = 5000;
   // 機体が動かされたと判断するジャイロのしきい値。
@@ -80,6 +86,16 @@ struct State {
 
   compass::MeasurementGate::Reject lastReject = compass::MeasurementGate::Reject::None;
 };
+
+// 今この瞬間、首をどこへ向けるべきか。ファームはこの指令をそのまま
+// Motion.move() に渡す。測定中は必ず正面に戻る。
+struct ServoIntent {
+  int yawDeciDegrees = 0;
+  int pitchDeciDegrees = pointing::kPitchLevelDeci;
+  bool shouldMove = false;
+};
+
+[[nodiscard]] ServoIntent servoIntentFor(const State& state);
 
 // 状態機械を 1 ステップ進める。副作用は持たず、State を書き換えるだけ。
 // サーボへの指令は State.lastSolve に入るので、呼び出し側が実際に動かす。

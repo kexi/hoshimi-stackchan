@@ -1,0 +1,10 @@
+#pragma once
+
+// このファイルを wifi_config.h にコピーして、自分の環境の値を入れる。
+// wifi_config.h は .gitignore 済み (認証情報をコミットしないため)。
+//
+// Wi-Fi は NTP で時刻を取るためだけに使う。設定しなくても動くが、
+// その場合は天体が解けず、真北しか指せない。
+
+#define WIFI_SSID "your-ssid"
+#define WIFI_PASSWORD "your-password"

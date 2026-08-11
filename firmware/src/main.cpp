@@ -1,48 +1,87 @@
-// 段階 8: 磁気ノイズの実測。この企画の成否を分ける工程。
+// compass-stackchan 本体。
 //
-// 測るのは 3 つ:
-//   1. サーボの通電状態 (電源OFF / トルクOFF / トルクON) で |B| がどれだけ変わるか
-//      → 差が 5uT を超えるなら、測定中にサーボ電源を落とす層 3 が必須
-//   2. yaw を 16 ビンに振ったときの方位測定値のばらつき
-//      → 2 度を超えるなら、角度依存バイアス表の層 4 が必須
-//   3. サーボ停止から方位が落ち着くまでの時間 → settleMillis を決める
+// 真北と天体 (太陽・月・水星〜土星) の方向を、首で物理的に指し示す。
+// yaw で方位を、pitch で高度を表す。
 //
-// 機体は固定して動かさないこと。首だけが動く。真方位は全ビンで同一のはずなので、
-// ビン間の差がそのままサーボ由来の誤差になる。
-//
-// 結果は NVS に書く (この個体は USB CDC が列挙されずシリアルが使えない)。
+// 磁気測定は必ず首を正面に戻してから行う。首の角度によって方位が最大 119 度
+// ずれることを実機で確認しているため (段階 8)。ロジックは app_core 側にあり、
+// ここは実機の入出力を state machine に橋渡しするだけ。
 
 #include <M5StackChan.h>
 #include <M5Unified.h>
 #include <Preferences.h>
+#include <WiFi.h>
 
+#include "app/state.hpp"
 #include "compass/calibration.hpp"
+#include "compass/declination.hpp"
 #include "compass/heading.hpp"
 #include "compass/stability.hpp"
+#include "location_config.h"
 
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <ctime>
+
+#if __has_include("wifi_config.h")
+#include "wifi_config.h"
+#else
+// 実体は .gitignore 済み。無ければ Wi-Fi を使わず、真北だけを指すモードで動く。
+#define WIFI_SSID ""
+#define WIFI_PASSWORD ""
+#endif
 
 namespace {
 
-constexpr const char* kResultNamespace = "stage8";
 constexpr const char* kCalibrationNamespace = "magcal";
-
 constexpr int kMoveSpeed = 400;
-// サーボ停止後、この時間まで方位を追いかけて収束を見る
-constexpr std::uint32_t kSettleProbeMillis = 2000;
+constexpr std::uint32_t kWifiTimeoutMillis = 20000;
+
+app::State g_state;
+app::Config g_config;
+astro::Observer g_observer;
 
 compass::MagCalibration g_calibration;
+compass::MeasurementGate g_gate;
+compass::HeadingFilter g_headingFilter{0.25F};
+compass::CalibrationCollector g_collector;
 
-void saveInt(const char* key, int value) {
-  Preferences preferences;
-  if (!preferences.begin(kResultNamespace, false)) {
-    return;
-  }
-  preferences.putInt(key, value);
-  preferences.end();
+bool g_timeValid = false;
+bool g_headingValid = false;
+float g_bodyTrueHeading = 0.0F;
+
+// 自前で持つサーボの動作状態。BSP の isMoving() は実サーボへ UART 問い合わせ
+// するのでコストが高く、毎周期は呼べない。
+std::uint32_t g_lastServoCommandMillis = 0;
+std::uint32_t g_lastServoStopMillis = 0;
+int g_commandedYaw = 0;
+int g_commandedPitch = pointing::kPitchLevelDeci;
+
+compass::Vec3 readMag() {
+  float x = 0.0F;
+  float y = 0.0F;
+  float z = 0.0F;
+  M5.Imu.getMag(&x, &y, &z);
+  return compass::Vec3{x, y, z};
+}
+
+compass::Vec3 readAccel() {
+  float x = 0.0F;
+  float y = 0.0F;
+  float z = 0.0F;
+  M5.Imu.getAccel(&x, &y, &z);
+  return compass::Vec3{x, y, z};
+}
+
+float readGyroMagnitude() {
+  float x = 0.0F;
+  float y = 0.0F;
+  float z = 0.0F;
+  M5.Imu.getGyro(&x, &y, &z);
+  return std::sqrt(x * x + y * y + z * z);
 }
 
 void loadCalibration() {
@@ -60,249 +99,155 @@ void loadCalibration() {
   preferences.end();
 }
 
-void showLine(int y, std::uint16_t color, const char* format, ...) {
-  char buffer[64];
-  va_list args;
-  va_start(args, format);
-  std::vsnprintf(buffer, sizeof(buffer), format, args);
-  va_end(args);
-
-  M5.Display.setTextColor(color, TFT_BLACK);
-  M5.Display.setCursor(4, y);
-  M5.Display.print(buffer);
-  M5.Display.print("      ");
+void saveCalibration(const compass::MagCalibration& calibration) {
+  Preferences preferences;
+  if (!preferences.begin(kCalibrationNamespace, false)) {
+    return;
+  }
+  preferences.putInt("offX", static_cast<int>(std::lround(calibration.hardIronOffset.x * 100.0F)));
+  preferences.putInt("offY", static_cast<int>(std::lround(calibration.hardIronOffset.y * 100.0F)));
+  preferences.putInt("offZ", static_cast<int>(std::lround(calibration.hardIronOffset.z * 100.0F)));
+  preferences.putInt("sclX", static_cast<int>(std::lround(calibration.softIronScale.x * 1000.0F)));
+  preferences.putInt("sclY", static_cast<int>(std::lround(calibration.softIronScale.y * 1000.0F)));
+  preferences.putInt("sclZ", static_cast<int>(std::lround(calibration.softIronScale.z * 1000.0F)));
+  preferences.putInt("valid", calibration.valid ? 1 : 0);
+  preferences.end();
 }
 
-compass::Vec3 readMagRaw() {
-  float x = 0.0F;
-  float y = 0.0F;
-  float z = 0.0F;
-  M5.Imu.getMag(&x, &y, &z);
-  return compass::Vec3{x, y, z};
-}
-
-compass::Vec3 readAccel() {
-  float x = 0.0F;
-  float y = 0.0F;
-  float z = 0.0F;
-  M5.Imu.getAccel(&x, &y, &z);
-  return compass::Vec3{x, y, z};
-}
-
-// mag が更新されるまで待って 1 サンプル取る。取れなければ false。
-bool waitForMagSample(compass::Vec3& magOut) {
+// Wi-Fi と NTP。失敗しても続行する。真北は時計が無くても指せる。
+void syncTime() {
+  if (std::strlen(WIFI_SSID) == 0) {
+    return;
+  }
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   const std::uint32_t start = millis();
-  while (millis() - start < 200) {
-    if ((M5.Imu.update() & m5::IMU_Class::sensor_mask_mag) != 0) {
-      magOut = readMagRaw();
-      return true;
-    }
-    delay(2);
+  while (WiFi.status() != WL_CONNECTED && millis() - start < kWifiTimeoutMillis) {
+    delay(200);
   }
-  return false;
-}
-
-struct FieldStats {
-  float meanMagnitude = 0.0F;
-  float meanHeading = 0.0F;
-  float headingSpread = 0.0F;
-  int samples = 0;
-};
-
-// 指定時間ぶん平均を取る。方位は円環量なので sin/cos で平均する。
-FieldStats sampleField(std::uint32_t durationMillis) {
-  FieldStats stats;
-  float magnitudeSum = 0.0F;
-  float sinSum = 0.0F;
-  float cosSum = 0.0F;
-  float minHeading = 999.0F;
-  float maxHeading = -999.0F;
-
-  const std::uint32_t start = millis();
-  while (millis() - start < durationMillis) {
-    compass::Vec3 raw;
-    if (!waitForMagSample(raw)) {
-      continue;
-    }
-    magnitudeSum += compass::magnitude(raw);
-
-    const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
-    const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
-    const float heading = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
-    const float radians = heading * 3.14159265F / 180.0F;
-    sinSum += std::sin(radians);
-    cosSum += std::cos(radians);
-    minHeading = std::fmin(minHeading, heading);
-    maxHeading = std::fmax(maxHeading, heading);
-    ++stats.samples;
-  }
-
-  if (stats.samples == 0) {
-    return stats;
-  }
-  stats.meanMagnitude = magnitudeSum / static_cast<float>(stats.samples);
-  stats.meanHeading = std::atan2(sinSum, cosSum) * 180.0F / 3.14159265F;
-  if (stats.meanHeading < 0.0F) {
-    stats.meanHeading += 360.0F;
-  }
-  stats.headingSpread = maxHeading - minHeading;
-  return stats;
-}
-
-float angleDifference(float from, float to) {
-  float difference = std::fmod(to - from, 360.0F);
-  if (difference > 180.0F) {
-    difference -= 360.0F;
-  }
-  if (difference <= -180.0F) {
-    difference += 360.0F;
-  }
-  return difference;
-}
-
-// 測定 1: サーボの通電状態による |B| の差
-void measurePowerStates() {
-  showLine(4, TFT_YELLOW, "1/3 power states");
-
-  // 首は正面・水平で固定したまま、通電状態だけを変える
-  M5StackChan.setServoPowerEnabled(true);
-  M5StackChan.Motion.setTorqueEnabled(true);
-  M5StackChan.Motion.move(0, 450, kMoveSpeed);
-  delay(2000);
-
-  const FieldStats torqueOn = sampleField(2000);
-  saveInt("fieldTorqueOn", static_cast<int>(std::lround(torqueOn.meanMagnitude * 100.0F)));
-  saveInt("headTorqueOn", static_cast<int>(std::lround(torqueOn.meanHeading * 10.0F)));
-  showLine(30, TFT_WHITE, "on   %.1f", static_cast<double>(torqueOn.meanMagnitude));
-
-  M5StackChan.Motion.setTorqueEnabled(false);
-  delay(1500);
-  const FieldStats torqueOff = sampleField(2000);
-  saveInt("fieldTorqueOff", static_cast<int>(std::lround(torqueOff.meanMagnitude * 100.0F)));
-  saveInt("headTorqueOff", static_cast<int>(std::lround(torqueOff.meanHeading * 10.0F)));
-  showLine(56, TFT_WHITE, "toff %.1f", static_cast<double>(torqueOff.meanMagnitude));
-
-  M5StackChan.setServoPowerEnabled(false);
-  delay(1500);
-  const FieldStats powerOff = sampleField(2000);
-  saveInt("fieldPowerOff", static_cast<int>(std::lround(powerOff.meanMagnitude * 100.0F)));
-  saveInt("headPowerOff", static_cast<int>(std::lround(powerOff.meanHeading * 10.0F)));
-  showLine(82, TFT_WHITE, "poff %.1f", static_cast<double>(powerOff.meanMagnitude));
-
-  // 層 3 の要否判定: 電源 OFF を基準に、通電時がどれだけずれるか
-  const float fieldDelta = std::fabs(torqueOn.meanMagnitude - powerOff.meanMagnitude);
-  const float headingDelta = std::fabs(angleDifference(powerOff.meanHeading, torqueOn.meanHeading));
-  saveInt("powerFieldDelta", static_cast<int>(std::lround(fieldDelta * 100.0F)));
-  saveInt("powerHeadDelta", static_cast<int>(std::lround(headingDelta * 10.0F)));
-  showLine(108, fieldDelta > 5.0F ? TFT_RED : TFT_GREEN, "dB=%.1f dH=%.1f",
-           static_cast<double>(fieldDelta), static_cast<double>(headingDelta));
-
-  // 以降の測定のためにサーボを戻す
-  M5StackChan.setServoPowerEnabled(true);
-  M5StackChan.Motion.setTorqueEnabled(true);
-  delay(1000);
-}
-
-// 測定 2: yaw 角度ごとの方位のばらつき。機体は固定なので真方位は不変のはず。
-void measureYawBias() {
-  M5.Display.fillScreen(TFT_BLACK);
-  showLine(4, TFT_YELLOW, "2/3 yaw bias");
-
-  constexpr int kBins = 16;
-  float headings[kBins] = {};
-  int validBins = 0;
-
-  for (int bin = 0; bin < kBins; ++bin) {
-    // -1280..1280 を 16 分割した各ビンの中央
-    const int yawDeci = -1280 + (2560 * bin) / kBins + (2560 / kBins) / 2;
-    M5StackChan.Motion.move(yawDeci, 450, kMoveSpeed);
-    delay(1400);
-
-    // トルクを切ってから測る (層 3 の効果込みの実力を見る)
-    M5StackChan.Motion.setTorqueEnabled(false);
-    delay(500);
-    const FieldStats stats = sampleField(700);
-    M5StackChan.Motion.setTorqueEnabled(true);
-
-    if (stats.samples > 0) {
-      headings[validBins++] = stats.meanHeading;
-      saveInt((String("yawBin") + bin).c_str(),
-              static_cast<int>(std::lround(stats.meanHeading * 10.0F)));
-    }
-    showLine(30, TFT_WHITE, "bin %d/%d", bin + 1, kBins);
-    showLine(56, TFT_CYAN, "hdg %.1f", static_cast<double>(stats.meanHeading));
-  }
-
-  // ビン間の最大差 (円環量なので基準を bin0 にして畳む)
-  float minDelta = 999.0F;
-  float maxDelta = -999.0F;
-  for (int bin = 0; bin < validBins; ++bin) {
-    const float delta = angleDifference(headings[0], headings[bin]);
-    minDelta = std::fmin(minDelta, delta);
-    maxDelta = std::fmax(maxDelta, delta);
-  }
-  const float spread = maxDelta - minDelta;
-  saveInt("yawSpread", static_cast<int>(std::lround(spread * 10.0F)));
-  saveInt("yawBinsOk", validBins);
-
-  showLine(82, spread > 2.0F ? TFT_RED : TFT_GREEN, "spread %.1f", static_cast<double>(spread));
-
-  M5StackChan.Motion.move(0, 450, kMoveSpeed);
-  delay(1500);
-}
-
-// 測定 3: サーボ停止から方位が落ち着くまでの時間
-void measureSettleTime() {
-  M5.Display.fillScreen(TFT_BLACK);
-  showLine(4, TFT_YELLOW, "3/3 settle time");
-
-  // 大きく振ってから止め、方位が最終値に収まるまでを追う
-  M5StackChan.Motion.move(-1000, 450, kMoveSpeed);
-  delay(2000);
-  M5StackChan.Motion.move(1000, 450, kMoveSpeed);
-
-  // 停止直後から 100ms 刻みで方位を記録する
-  constexpr int kSlots = 20;
-  float samples[kSlots] = {};
-  int slotCount = 0;
-
-  const std::uint32_t moveStart = millis();
-  // move の収束を待ってから計測を始める
-  delay(1200);
-  const std::uint32_t stopMillis = millis();
-
-  while (millis() - stopMillis < kSettleProbeMillis && slotCount < kSlots) {
-    const FieldStats stats = sampleField(100);
-    if (stats.samples > 0) {
-      samples[slotCount++] = stats.meanHeading;
-    }
-  }
-  saveInt("settleSlots", slotCount);
-  saveInt("moveElapsed", static_cast<int>(millis() - moveStart));
-
-  if (slotCount < 3) {
-    showLine(30, TFT_RED, "no samples");
+  if (WiFi.status() != WL_CONNECTED) {
     return;
   }
 
-  // 最終値から 1 度以内に入った最初の時刻を収束時刻とみなす
-  const float finalHeading = samples[slotCount - 1];
-  int settleSlot = slotCount - 1;
-  for (int slot = 0; slot < slotCount; ++slot) {
-    if (std::fabs(angleDifference(finalHeading, samples[slot])) < 1.0F) {
-      settleSlot = slot;
-      break;
+  configTime(0, 0, "ntp.nict.jp", "pool.ntp.org");
+  const std::uint32_t ntpStart = millis();
+  while (millis() - ntpStart < 10000) {
+    if (std::time(nullptr) > 1700000000) {
+      g_timeValid = true;
+      return;
     }
+    delay(200);
   }
-  const int settleMillis = settleSlot * 100;
-  saveInt("settleMillis", settleMillis);
+}
 
-  // 動作直後と最終値の差 = 動いている最中の誤差の大きさ
-  const float initialError = std::fabs(angleDifference(finalHeading, samples[0]));
-  saveInt("settleInitErr", static_cast<int>(std::lround(initialError * 10.0F)));
+// サーボへ指令を出す。動作中の推定にも使う。
+void commandServo(int yawDeci, int pitchDeci) {
+  const bool unchanged = yawDeci == g_commandedYaw && pitchDeci == g_commandedPitch;
+  if (unchanged) {
+    return;
+  }
+  g_commandedYaw = yawDeci;
+  g_commandedPitch = pitchDeci;
+  g_lastServoCommandMillis = millis();
+  M5StackChan.Motion.move(yawDeci, pitchDeci, kMoveSpeed);
+}
 
-  showLine(30, TFT_GREEN, "settle %d ms", settleMillis);
-  showLine(56, TFT_WHITE, "initErr %.1f", static_cast<double>(initialError));
+// 指令からの経過で動作中かを推定する。UART 問い合わせを毎周期しないための近似。
+bool servoLikelyMoving(std::uint32_t nowMillis) {
+  return nowMillis - g_lastServoCommandMillis < g_config.servoSettleMillis;
+}
+
+app::Input readInput() {
+  if (M5StackChan.TouchSensor.wasSwipedForward()) {
+    return app::Input::SwipeForward;
+  }
+  if (M5StackChan.TouchSensor.wasSwipedBackward()) {
+    return app::Input::SwipeBackward;
+  }
+  if (M5StackChan.TouchSensor.wasClicked()) {
+    return app::Input::Click;
+  }
+  return app::Input::None;
+}
+
+// 磁気を 1 サンプル取り込む。新しい値が来ていなければ何もしない。
+void updateHeading() {
+  if ((M5.Imu.update() & m5::IMU_Class::sensor_mask_mag) == 0) {
+    return;
+  }
+
+  const compass::Vec3 raw = readMag();
+  if (g_state.phase == app::Phase::Calibrating) {
+    g_collector.addSample(raw);
+    return;
+  }
+
+  const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
+  const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
+  const float magneticHeading = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
+  g_headingFilter.update(magneticHeading);
+
+  // 静穏時の |B| を学習する。採用できる状況のときだけ。
+  if (compass::isMeasurementPose(g_commandedYaw) && !servoLikelyMoving(millis())) {
+    g_gate.learnReferenceField(compass::magnitude(raw));
+  }
+}
+
+void drawStatus() {
+  auto& display = M5.Display;
+  display.setTextSize(2);
+
+  display.setTextColor(TFT_WHITE, TFT_BLACK);
+  display.setCursor(4, 4);
+  display.printf("%-9s      ", astro::targetName(g_state.target));
+
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(4, 30);
+  display.printf("%-14s", app::phaseName(g_state.phase));
+
+  if (g_state.phase == app::Phase::Calibrating) {
+    display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    display.setCursor(4, 60);
+    display.printf("rotate fig-8 %d%%  ", static_cast<int>(g_collector.coverage() * 100.0F));
+    return;
+  }
+
+  if (!g_state.lastPosition.valid) {
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    display.setCursor(4, 60);
+    display.print("no time sync   ");
+    return;
+  }
+
+  display.setTextColor(TFT_CYAN, TFT_BLACK);
+  display.setCursor(4, 60);
+  display.printf("az %5.1f      ",
+                 static_cast<double>(g_state.lastPosition.horizontal.azimuthDegrees));
+  display.setCursor(4, 86);
+  display.printf("alt %+5.1f     ",
+                 static_cast<double>(g_state.lastPosition.horizontal.altitudeDegrees));
+
+  // 首が届いていないなら、そのことを伝える。黙って端に張り付くと
+  // 「指している」と誤解される。
+  display.setCursor(4, 116);
+  if (g_state.lastSolve.command.clampedPitch) {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.printf("%+.0f deg higher  ",
+                   static_cast<double>(g_state.lastSolve.unreachablePitchDegrees));
+  } else if (g_state.lastSolve.command.clampedYaw) {
+    display.setTextColor(TFT_ORANGE, TFT_BLACK);
+    display.print("turn me around ");
+  } else if (!g_state.lastPosition.aboveHorizon) {
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    display.print("below horizon  ");
+  } else {
+    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.print("pointing       ");
+  }
+
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(4, 146);
+  display.printf("hdg %5.1f %s  ", static_cast<double>(g_bodyTrueHeading),
+                 g_state.autoCycleEnabled ? "auto" : "    ");
 }
 
 } // namespace
@@ -311,34 +256,91 @@ void setup() {
   auto config = M5.config();
   M5.begin(config);
   M5.Display.setRotation(1);
-  M5.Display.setTextSize(2);
   M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setTextSize(2);
 
   M5StackChan.begin();
+  // 指した姿勢を保つために必須。既定では静止 200ms でトルクが切れて首が垂れる。
   M5StackChan.Motion.setAutoTorqueReleaseEnabled(false);
+  // 追尾中は高頻度で角度を更新するので、同期は切っておく。
   M5StackChan.Motion.setAutoAngleSyncEnabled(false);
 
+  g_observer.latitudeDegrees = kSiteLatitudeDegrees;
+  g_observer.longitudeEastDegrees = kSiteLongitudeEastDegrees;
+
   loadCalibration();
+  syncTime();
+
+  // キャリブレーションが無ければ 8 の字回しから始める。
   if (!g_calibration.valid) {
-    showLine(4, TFT_RED, "no calibration");
-    showLine(30, TFT_WHITE, "run stage7 first");
-    return;
+    g_state.phase = app::Phase::Calibrating;
+    g_collector.reset();
   }
-
-  showLine(4, TFT_WHITE, "keep body still");
-  delay(2000);
-
-  measurePowerStates();
-  measureYawBias();
-  measureSettleTime();
-
-  M5.Display.fillScreen(TFT_BLACK);
-  showLine(4, TFT_GREEN, "=== measured ===");
-  showLine(30, TFT_WHITE, "read via just");
-  showLine(56, TFT_WHITE, "read-nvs");
 }
 
 void loop() {
   M5StackChan.update();
-  delay(50);
+  const std::uint32_t now = millis();
+
+  updateHeading();
+
+  // 8 の字回しの完了判定
+  if (g_state.phase == app::Phase::Calibrating && g_collector.coverage() >= 1.0F) {
+    const compass::MagCalibration calibration = g_collector.finish();
+    if (calibration.valid) {
+      g_calibration = calibration;
+      saveCalibration(calibration);
+      g_headingFilter.reset();
+    }
+  }
+
+  // 測定ゲート。首が正面にあり、静止していて、値が安定しているときだけ採用する。
+  compass::MeasurementGate::Input gateInput;
+  gateInput.nowMillis = now;
+  gateInput.servoMoving = servoLikelyMoving(now);
+  gateInput.lastServoStopMillis = g_lastServoStopMillis;
+  gateInput.gyroMagnitudeDegPerSec = readGyroMagnitude();
+  gateInput.fieldMagnitudeMicroTesla = compass::magnitude(readMag());
+  gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
+  gateInput.yawDeciDegrees = g_commandedYaw;
+
+  if (!gateInput.servoMoving) {
+    g_lastServoStopMillis = g_lastServoCommandMillis + g_config.servoSettleMillis;
+  }
+
+  const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
+  const bool accepted = reject == compass::MeasurementGate::Reject::None;
+  if (accepted && g_headingFilter.hasValue()) {
+    g_bodyTrueHeading =
+        compass::trueHeadingFromMagnetic(g_headingFilter.valueDegrees(), kSiteDeclinationEast);
+    g_headingValid = true;
+  }
+
+  app::Tick tick;
+  tick.nowMillis = now;
+  tick.unixSeconds = static_cast<std::int64_t>(std::time(nullptr));
+  tick.timeValid = g_timeValid;
+  tick.calibrationValid = g_calibration.valid;
+  tick.input = readInput();
+  tick.bodyTrueHeadingDegrees = g_bodyTrueHeading;
+  tick.headingValid = g_headingValid;
+  tick.measurementAccepted = accepted;
+  tick.lastReject = reject;
+  tick.gyroMagnitudeDegPerSec = gateInput.gyroMagnitudeDegPerSec;
+  tick.servoSettled = !gateInput.servoMoving;
+
+  app::step(g_state, tick, g_config, g_observer);
+
+  const app::ServoIntent intent = app::servoIntentFor(g_state);
+  if (intent.shouldMove) {
+    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees);
+  }
+
+  static std::uint32_t lastDraw = 0;
+  if (now - lastDraw >= 200) {
+    lastDraw = now;
+    drawStatus();
+  }
+
+  delay(10);
 }

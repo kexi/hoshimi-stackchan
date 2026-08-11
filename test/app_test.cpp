@@ -100,8 +100,9 @@ void testMeasurementTimeoutWithoutHeading() {
   app::Config config;
   std::uint32_t clock = 0;
 
-  // まず Measuring まで進める
-  for (int step = 0; step < 5; ++step) {
+  // まず Measuring まで進める。
+  // 首を正面に戻す ReturningToMeasurePose を挟むので、その settle 時間も要る。
+  for (int step = 0; step < 12; ++step) {
     clock += 200;
     app::Tick tick = healthyTick(clock);
     tick.measurementAccepted = false;
@@ -136,8 +137,8 @@ void testSwipeChangesTarget() {
   forward.input = app::Input::SwipeForward;
   app::step(state, forward, config, tokyoObserver());
   CHECK_TRUE(state.target == astro::Target::Sun);
-  // ターゲットが変わったら方位から測り直す
-  CHECK_TRUE(state.phase == app::Phase::Measuring);
+  // ターゲットが変わったら、首を正面に戻すところから測り直す
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 
   advanceUntil(state, app::Phase::Tracking, clock, config);
   clock += 200;
@@ -192,7 +193,8 @@ void testBodyMovementTriggersRemeasure() {
   app::Tick shaken = healthyTick(clock);
   shaken.gyroMagnitudeDegPerSec = 120.0F;
   app::step(state, shaken, config, tokyoObserver());
-  CHECK_TRUE(state.phase == app::Phase::Measuring);
+  // 機体が動かされたら、首を正面に戻して測り直す
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 }
 
 void testMillisWrapDoesNotBreakTransitions() {
@@ -241,9 +243,72 @@ void testTrackingUpdatesAsSkyMoves() {
   CHECK_TRUE(state.lastSolve.command.yawDeciDegrees != firstYaw);
 }
 
+void testMeasurementPoseIsCommanded() {
+  // 実測で首の角度による誤差が 119 度と分かった以上、測定に関わる局面では
+  // 必ず首が正面に戻ること。ここが崩れると方位が根本から狂う。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+
+  // Measuring / ReturningToMeasurePose を通るまで進める
+  bool sawMeasurePose = false;
+  for (int step = 0; step < 40; ++step) {
+    clock += 200;
+    app::step(state, healthyTick(clock), config, tokyoObserver());
+    const bool isMeasurePhase =
+        state.phase == app::Phase::ReturningToMeasurePose || state.phase == app::Phase::Measuring;
+    if (!isMeasurePhase) {
+      continue;
+    }
+    sawMeasurePose = true;
+    const app::ServoIntent intent = app::servoIntentFor(state);
+    CHECK_TRUE(intent.yawDeciDegrees == compass::kMeasurementYawDeci);
+    CHECK_TRUE(intent.pitchDeciDegrees == pointing::kPitchLevelDeci);
+    CHECK_TRUE(intent.shouldMove);
+    // ゲートから見ても測定してよい姿勢であること
+    CHECK_TRUE(compass::isMeasurementPose(intent.yawDeciDegrees));
+  }
+  CHECK_TRUE(sawMeasurePose);
+
+  // 追尾中は解いた方向を指す (正面に固定されたままではない)
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+  clock += 200;
+  app::Tick swipe = healthyTick(clock);
+  swipe.input = app::Input::SwipeForward; // 太陽へ
+  app::step(state, swipe, config, tokyoObserver());
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+
+  const app::ServoIntent tracking = app::servoIntentFor(state);
+  CHECK_TRUE(tracking.yawDeciDegrees == state.lastSolve.command.yawDeciDegrees);
+  CHECK_TRUE(tracking.pitchDeciDegrees == state.lastSolve.command.pitchDeciDegrees);
+}
+
+void testMeasurePoseSettleIsRespected() {
+  // 首を戻した直後に測ると意味がないので、settle 時間は必ず待つこと。
+  app::State state;
+  app::Config config;
+  config.measurePoseSettleMillis = 1000;
+  std::uint32_t clock = 0;
+
+  advanceUntil(state, app::Phase::ReturningToMeasurePose, clock, config);
+  const std::uint32_t entered = clock;
+
+  // settle 未満では Measuring に進まない
+  clock += 400;
+  app::step(state, healthyTick(clock), config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+
+  // settle を超えたら進む
+  clock = entered + 1200;
+  app::step(state, healthyTick(clock), config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::Measuring);
+}
+
 } // namespace
 
 int main() {
+  testMeasurementPoseIsCommanded();
+  testMeasurePoseSettleIsRespected();
   testBootReachesTracking();
   testCalibrationGate();
   testTimeInvalidStillPointsNorth();
