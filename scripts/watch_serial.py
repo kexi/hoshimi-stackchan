@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyserial==3.5"]
+# ///
 """実機の状態をシリアルから読み続ける。
 
 NVS 経由では動作中の状態が取れない。フラッシュ読み出しは esptool のリセットを
@@ -14,10 +18,10 @@ import os
 import sys
 import time
 
-import serial
+from serial_connection import open_serial_without_reset
 
 
-def watch(port, seconds):
+def watch(port, seconds, on_line=None):
     """切断を挟みながら指定秒数ぶん行を読む。読めた行を返す。"""
     deadline = time.time() + seconds
     lines = []
@@ -28,7 +32,7 @@ def watch(port, seconds):
             time.sleep(0.2)
             continue
         try:
-            connection = serial.Serial(port, 115200, timeout=0.5)
+            connection = open_serial_without_reset(port)
         except OSError:
             time.sleep(0.2)
             continue
@@ -46,6 +50,12 @@ def watch(port, seconds):
                     if text.startswith("phase="):
                         lines.append(text)
                         print(f"{time.strftime('%H:%M:%S')} {text}", flush=True)
+                        has_callback = on_line is not None
+                        if has_callback:
+                            should_continue = on_line(connection, text)
+                            should_stop = should_continue is False
+                            if should_stop:
+                                return lines
         except OSError:
             pass
         finally:

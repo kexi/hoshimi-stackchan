@@ -124,7 +124,7 @@ void ServoBiasTable::reset() {
   observationCount_.fill(0);
 }
 
-void ServoBiasTable::observe(int yawDeciDegrees, float headingErrorDegrees) {
+bool ServoBiasTable::observe(int yawDeciDegrees, float headingErrorDegrees) {
   const std::size_t index = binIndexFor(yawDeciDegrees);
   const std::uint16_t previousCount = observationCount_[index];
 
@@ -132,7 +132,7 @@ void ServoBiasTable::observe(int yawDeciDegrees, float headingErrorDegrees) {
   if (previousCount == 0) {
     correction_[index] = headingErrorDegrees;
     observationCount_[index] = 1;
-    return;
+    return true;
   }
   if (previousCount < 1000) {
     observationCount_[index] = static_cast<std::uint16_t>(previousCount + 1);
@@ -140,6 +140,14 @@ void ServoBiasTable::observe(int yawDeciDegrees, float headingErrorDegrees) {
   const float weight = 1.0F / static_cast<float>(observationCount_[index]);
   // 誤差も円環量なので、単純な差ではなく最短角差で寄せる。
   correction_[index] += weight * angleDifference(correction_[index], headingErrorDegrees);
+
+  // 1,2,4,...回目だけを永続化候補にする。毎観測をdirtyにすると、静止中に
+  // 30秒ごと永続的にNVSへ書き続ける。標本が増えるほど保存を間引いても、
+  // 再起動後に最初の1点だけへ戻る問題は避けられる。
+  const std::uint16_t currentCount = observationCount_[index];
+  const bool isPowerOfTwo = (currentCount & static_cast<std::uint16_t>(currentCount - 1)) == 0;
+  const bool reachedMaximum = currentCount == 1000 && previousCount < 1000;
+  return isPowerOfTwo || reachedMaximum;
 }
 
 float ServoBiasTable::correctionDegrees(int yawDeciDegrees) const {
@@ -163,6 +171,10 @@ float ServoBiasTable::correctionDegrees(int yawDeciDegrees) const {
 }
 
 bool ServoBiasTable::isPopulated() const { return populatedBinCount() >= kMinPopulatedBins; }
+
+bool ServoBiasTable::hasObservationFor(int yawDeciDegrees) const {
+  return observationCount_[binIndexFor(yawDeciDegrees)] > 0;
+}
 
 std::size_t ServoBiasTable::populatedBinCount() const {
   std::size_t populated = 0;

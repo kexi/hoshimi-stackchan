@@ -15,6 +15,13 @@ struct Attitude {
 // 重力ベクトルから roll/pitch を出す。静止していることが前提。
 [[nodiscard]] Attitude attitudeFromAccel(Vec3 accel);
 
+// 機体座標の磁気を、重力に垂直な水平X/Yへ投影する。
+// 水平回転キャリブレーションは、この座標で円を当てはめる。
+[[nodiscard]] Vec3 horizontalMagneticComponents(Vec3 magneticField, Attitude attitude);
+
+// 水平X/Yから磁北基準の方位を出す [度, 0..360)。
+[[nodiscard]] float headingDegreesFromHorizontal(Vec3 horizontalMagneticField);
+
 // 傾斜補正済みの磁気方位 [度, 0..360)。磁北基準。
 // mag はキャリブレーション適用済みの値を渡すこと。
 [[nodiscard]] float tiltCompensatedHeadingDegrees(Vec3 calibratedMag, Attitude attitude);

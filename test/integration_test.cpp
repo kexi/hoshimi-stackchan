@@ -23,7 +23,7 @@ constexpr double kTokyoLongitudeEast = 139.767125;
 constexpr float kTokyoDeclinationEast = -7.9F;
 
 // 2026-08-11 12:00 JST = 03:00 UTC
-constexpr std::int64_t kNoonJst = 1786064400;
+constexpr std::int64_t kNoonJst = 1786417200;
 
 astro::Observer tokyoObserver() {
   astro::Observer observer;
@@ -46,8 +46,10 @@ void testGoldenServoCommands() {
   input.bodyHeadingDegrees = 0.0;
   const pointing::SolveResult sunSolve = pointing::solve(input);
 
-  // 正午の太陽は南寄り・高い。首は南 (yaw が大きい) を向き、pitch は上限に張り付く。
-  CHECK_TRUE(sunSolve.command.yawDeciDegrees > 0);
+  // 正午の太陽は南寄り・高い。真北向きから最短側の負yawへ振り、両軸とも
+  // 可動域端へ張り付く。
+  CHECK_TRUE(sunSolve.command.yawDeciDegrees == pointing::kYawMinDeci);
+  CHECK_TRUE(sunSolve.command.clampedYaw);
   CHECK_TRUE(sunSolve.command.pitchDeciDegrees == pointing::kPitchMaxDeci);
   CHECK_TRUE(sunSolve.command.clampedPitch);
   CHECK_TRUE(sunSolve.unreachablePitchDegrees > 10.0);
@@ -105,15 +107,14 @@ void testDeclinationMattersEndToEnd() {
 }
 
 void testSummerNoonSunExceedsNeckRange() {
-  // 東京の夏の正午、機体が真北を向いていると、太陽は方位 122 度・高度 59 度。
-  // 偏角を入れて機体基準に直すと必要な yaw が 130 度になり、首の可動域
-  // (±128 度) を超える。「体ごと回して」と伝えるべき場面が実際に起きることを
-  // 固定しておく (この条件を知らずに組むと、指せていないのに指せたつもりになる)。
+  // 東京の夏の正午、太陽は方位189度・高度69度。機体が磁北を向いていると
+  // 真方位は352.1度なので、太陽への最短yawは約-163度となって可動域
+  // (±128度)を超える。「体ごと回して」と伝えるべき実例を固定しておく。
   const astro::Observer observer = tokyoObserver();
   const astro::TargetPosition sun =
       astro::computeTargetPosition(astro::Target::Sun, kNoonJst, observer, true);
-  CHECK_NEAR(sun.horizontal.azimuthDegrees, 122.03, 0.2);
-  CHECK_NEAR(sun.horizontal.altitudeDegrees, 59.46, 0.2);
+  CHECK_NEAR(sun.horizontal.azimuthDegrees, 189.47, 0.2);
+  CHECK_NEAR(sun.horizontal.altitudeDegrees, 69.38, 0.2);
 
   pointing::SolveInput input;
   input.targetAzimuthDegrees = sun.horizontal.azimuthDegrees;
@@ -123,7 +124,7 @@ void testSummerNoonSunExceedsNeckRange() {
   const pointing::SolveResult result = pointing::solve(input);
   CHECK_TRUE(result.command.clampedYaw);
   CHECK_TRUE(pointing::needsBodyRotation(result));
-  // 高度 59 度も pitch の上限 (45 度) を超える
+  // 高度69度もpitchの上限(45度)を超える。
   CHECK_TRUE(result.command.clampedPitch);
   CHECK_TRUE(result.command.pitchDeciDegrees == pointing::kPitchMaxDeci);
 }

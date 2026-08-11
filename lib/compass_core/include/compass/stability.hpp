@@ -86,7 +86,7 @@ public:
 
   explicit MeasurementGate(MeasurementGateConfig config = {});
 
-  // 静穏時の |B| を学習する。採用されたサンプルだけを食わせること。
+  // 静穏時の校正済み水平|B|を学習する。採用されたサンプルだけを食わせること。
   void learnReferenceField(float fieldMagnitudeMicroTesla);
   [[nodiscard]] float referenceFieldMicroTesla() const;
   [[nodiscard]] bool hasReferenceField() const;
@@ -116,17 +116,23 @@ public:
   static constexpr int kYawMaxDeci = 1280;
   // 補正として信用するのに要るビン数。
   //
-  // 未学習ビンは近いビンの値を借りるが、実測の誤差は角度にほぼ比例して
-  // 増える (16 ビンで 119 度 = 1 ビンあたり約 7 度)。1 ビンしか無い状態で
-  // 全角度に同じ値を当てると、遠い角度ほど外れる。半分は埋めてから使う。
+  // 明示的な全域学習を完了とみなすのに要るビン数。通常の追尾ではこの数を
+  // 待たず、hasObservationFor() が真の角度だけ補正する。
   static constexpr std::size_t kMinPopulatedBins = 8;
 
   void reset();
-  void observe(int yawDeciDegrees, float headingErrorDegrees);
+  // 観測を平均へ加え、NVSへ保存すべき節目ならtrueを返す。
+  [[nodiscard]] bool observe(int yawDeciDegrees, float headingErrorDegrees);
   // 学習済みのビンが無ければ 0 を返す (補正しない)。
   [[nodiscard]] float correctionDegrees(int yawDeciDegrees) const;
   [[nodiscard]] bool isPopulated() const;
   [[nodiscard]] std::size_t populatedBinCount() const;
+
+  // その角度を実際に観測して覚えているか。
+  //
+  // 借り物の値では足りない角度がある。実機では未学習の角度に首が向いた
+  // 瞬間に方位が 270 度飛んだ。補正を当ててよいかはこれで判断する。
+  [[nodiscard]] bool hasObservationFor(int yawDeciDegrees) const;
 
   [[nodiscard]] static std::size_t binIndexFor(int yawDeciDegrees);
 

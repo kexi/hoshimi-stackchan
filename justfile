@@ -1,6 +1,26 @@
 default:
     @just --list
 
+# --- 開発環境 ---
+
+setup:
+    lefthook install
+
+doctor:
+    @git --version
+    @just --version
+    @cmake --version | head -1
+    @clang-tidy --version | head -1
+    @pio --version
+    @python3 --version
+    @uv --version
+    @gitleaks version
+    @pinact version
+    @actionlint --version
+
+update:
+    nix flake update
+
 # --- ホストビルド (ESP32 非依存コア + テスト) ---
 
 configure:
@@ -11,6 +31,16 @@ compile: configure
 
 test-host: compile
     ctest --test-dir build/host --output-on-failure
+
+test-python:
+    python3 -m unittest discover -s test/python -p 'test_*.py'
+
+test: test-host test-python
+
+# JPL Horizonsの公開データから、実機へ埋め込む高精度暦DBと独立検証値を更新する。
+# 通常のbuild/testは生成済みファイルを使うため、ネット接続は不要。
+update-ephemeris:
+    uv run scripts/generate_ephemeris_db.py
 
 # --- 整形・静的解析 ---
 
@@ -25,13 +55,25 @@ fmt-check:
 lint: configure
     run-clang-tidy -p build/host -j 2 -quiet
 
+clang-format: fmt
+
+clang-format-check: fmt-check
+
+clang-tidy: lint
+
+justfile-fmt-check:
+    just --fmt --check
+
+justfile-fmt:
+    just --fmt
+
 # --- ファームウェア ---
 
 build:
     pio run --project-dir firmware
 
-# ホストの時計で実機の RTC を合わせて書き込む。
-# Wi-Fi が無い場所でも天体を指せるようにするため、ビルド時刻を埋め込む。
+# ファームウェアを書き込んだ後、ホストの現在時刻をUSB経由でRTCへ同期する。
+# 書き込み時間の予測値は使わず、CoreS3の設定完了応答まで確認する。
 set-time:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -41,14 +83,14 @@ set-time:
       echo "CoreS3 が見つかりません (hwid 303A:1001)" >&2
       exit 1
     fi
-    # 書き込みに約 30 秒かかるぶんを見込んで先の時刻を入れる
-    now=$(python3 -c 'import time; print(int(time.time()) + 35)')
-    PLATFORMIO_BUILD_FLAGS="-DBUILD_UNIX_TIME=${now}" \
-      pio run --project-dir firmware --target upload --upload-port "$port"
-    echo "RTC を $(date -r "$now" '+%Y-%m-%d %H:%M:%S') に合わせました" 
+    pio run --project-dir firmware --target upload --upload-port "$port"
+    uv run scripts/set_device_time.py "$port"
 
 upload port='':
     pio run --project-dir firmware --target upload {{ if port == '' { '' } else { '--upload-port ' + port } }}
+
+flash port='':
+    just upload "{{ port }}"
 
 # CoreS3 は /dev/cu.debug-console も見えるので、USB シリアル (303A:1001) だけを掴む
 monitor:
@@ -62,9 +104,8 @@ monitor:
     fi
     pio device monitor --project-dir firmware --port "$port"
 
-# 実機の計測結果を NVS から回収する。
-# この個体は USB CDC シリアルが列挙されないため、ファームは結果を NVS に書き、
-# ここでフラッシュごと吸い出して読む (シリアルに頼らずログが取れる)
+# 起動直後の診断値をNVSから回収する。読み出しは実機をリセットするため、
+# 動作中の追跡にはwatch/verifyを使い、シリアルが使えない場合の補助に限る。
 read-nvs filter='':
     #!/usr/bin/env bash
     set -euo pipefail
@@ -91,11 +132,14 @@ watch seconds='30':
       echo "CoreS3 が見つかりません (hwid 303A:1001)" >&2
       exit 1
     fi
-    python3 scripts/watch_serial.py "$port" {{ seconds }}
+    uv run scripts/watch_serial.py "$port" {{ seconds }}
+
+logs seconds='30':
+    just watch {{ seconds }}
 
 # 実機の動作を検証する。キャリブレーション・時刻・方位・ターゲット切り替えを
 # 順に確かめ、足りないものを具体的に出す。
-verify:
+verify seconds='120':
     #!/usr/bin/env bash
     set -euo pipefail
     port=$(pio device list --json-output \
@@ -104,7 +148,7 @@ verify:
       echo "CoreS3 が見つかりません (hwid 303A:1001)" >&2
       exit 1
     fi
-    python3 scripts/verify_device.py "$port"
+    uv run scripts/verify_device.py "$port" {{ seconds }}
 
 clean:
     pio run --project-dir firmware --target clean
@@ -117,18 +161,61 @@ actionlint:
 
 # --check: 未ピンの action があれば fail / --verify: SHA が注記のタグと一致するかリモート照合
 pinact:
-    pinact run --check --verify --min-age 1
+    just pinact-verify
+
+pinact-check:
+    pinact run --fix=false --no-api
+
+pinact-verify:
+    pinact run --fix=false --verify-comment --verify-min-age --min-age 1
 
 pin-actions:
     pinact run --min-age 1
 
-actions: actionlint pinact
+actions: actionlint pinact-check
 
-secrets:
+secrets-history:
     gitleaks git --redact
+
+secrets-worktree:
+    gitleaks dir . --redact
+
+secrets: secrets-history secrets-worktree
 
 secrets-staged:
     gitleaks git --pre-commit --staged --redact
 
+gitleaks: secrets
+
+gitleaks-staged: secrets-staged
+
+# ホスト、ファームウェア、設定の通常品質ゲート。外部APIが必要な検査はciへ分ける。
+check: justfile-fmt-check fmt-check lint test build
+
 # CI の入口。ローカルと CI で同じ recipe を通す。
-all: fmt-check lint actions secrets test-host build
+ci: check actionlint pinact-verify secrets
+
+all: ci
+
+# 環境と再現可能な検査結果を、端末固有の無視対象ディレクトリへまとめる。
+# seconds > 0 のときだけ、接続中CoreS3の有界ログも追加する。
+diagnose seconds='0':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+    destination="$PWD/.stackchan/diagnostics/$stamp"
+    mkdir -p "$destination"
+    set +e
+    {
+      echo "revision=$(git rev-parse HEAD)"
+      git status --short
+      just doctor
+      just test
+      if [ "{{ seconds }}" -gt 0 ]; then
+        just watch "{{ seconds }}"
+      fi
+    } 2>&1 | tee "$destination/diagnose.log"
+    status=${PIPESTATUS[0]}
+    set -e
+    echo "diagnostics=$destination"
+    exit "$status"

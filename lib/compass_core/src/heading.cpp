@@ -35,18 +35,28 @@ Attitude attitudeFromAccel(Vec3 accel) {
   return attitude;
 }
 
-float tiltCompensatedHeadingDegrees(Vec3 calibratedMag, Attitude attitude) {
+Vec3 horizontalMagneticComponents(Vec3 magneticField, Attitude attitude) {
   const float sinRoll = std::sin(attitude.rollRadians);
   const float cosRoll = std::cos(attitude.rollRadians);
   const float sinPitch = std::sin(attitude.pitchRadians);
   const float cosPitch = std::cos(attitude.pitchRadians);
 
   // 機体座標の磁場を水平面へ倒し込む。
-  const float horizontalX = calibratedMag.x * cosPitch + calibratedMag.y * sinRoll * sinPitch +
-                            calibratedMag.z * cosRoll * sinPitch;
-  const float horizontalY = calibratedMag.y * cosRoll - calibratedMag.z * sinRoll;
+  Vec3 horizontal;
+  horizontal.x = magneticField.x * cosPitch + magneticField.y * sinRoll * sinPitch +
+                 magneticField.z * cosRoll * sinPitch;
+  horizontal.y = magneticField.y * cosRoll - magneticField.z * sinRoll;
+  horizontal.z = 0.0F;
+  return horizontal;
+}
 
-  return normalizeDegrees(std::atan2(-horizontalY, horizontalX) * kRad2Deg);
+float headingDegreesFromHorizontal(Vec3 horizontalMagneticField) {
+  return normalizeDegrees(std::atan2(-horizontalMagneticField.y, horizontalMagneticField.x) *
+                          kRad2Deg);
+}
+
+float tiltCompensatedHeadingDegrees(Vec3 calibratedMag, Attitude attitude) {
+  return headingDegreesFromHorizontal(horizontalMagneticComponents(calibratedMag, attitude));
 }
 
 HeadingFilter::HeadingFilter(float smoothingFactor)

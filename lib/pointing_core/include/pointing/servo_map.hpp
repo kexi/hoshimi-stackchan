@@ -52,4 +52,9 @@ struct ServoCommand {
 [[nodiscard]] bool isYawReachable(int yawDeciDegrees);
 [[nodiscard]] bool isPitchReachable(int pitchDeciDegrees);
 
+// 実角度が指令角度へ両軸とも到達したか。
+[[nodiscard]] bool isServoAtTarget(int actualYawDeciDegrees, int actualPitchDeciDegrees,
+                                   int targetYawDeciDegrees, int targetPitchDeciDegrees,
+                                   int toleranceDeciDegrees);
+
 } // namespace pointing

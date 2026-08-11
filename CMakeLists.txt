@@ -14,6 +14,7 @@ add_library(
   lib/astro_core/src/angles.cpp
   lib/astro_core/src/time.cpp
   lib/astro_core/src/coords.cpp
+  lib/astro_core/src/ephemeris_db.cpp
   lib/astro_core/src/sun.cpp
   lib/astro_core/src/moon.cpp
   lib/astro_core/src/planets.cpp
@@ -39,8 +40,12 @@ add_library(
 target_include_directories(pointing_core PUBLIC lib/pointing_core/include)
 target_compile_options(pointing_core PRIVATE ${COMPASS_WARNINGS})
 
-# 状態機械。実機とシミュレータで同じものを動かす。
-add_library(app_core lib/app_core/src/state.cpp)
+add_library(connectivity_core lib/connectivity_core/src/geoip.cpp)
+target_include_directories(connectivity_core PUBLIC lib/connectivity_core/include)
+target_compile_options(connectivity_core PRIVATE ${COMPASS_WARNINGS})
+
+# 状態機械と表示モデル。実機とシミュレータで同じものを動かす。
+add_library(app_core lib/app_core/src/presentation.cpp lib/app_core/src/state.cpp)
 target_include_directories(app_core PUBLIC lib/app_core/include)
 target_link_libraries(app_core PUBLIC astro_core compass_core pointing_core)
 target_compile_options(app_core PRIVATE ${COMPASS_WARNINGS})
@@ -98,4 +103,10 @@ if(BUILD_TESTING)
   target_include_directories(integration-test PRIVATE test)
   target_compile_options(integration-test PRIVATE ${COMPASS_WARNINGS})
   add_test(NAME integration-test COMMAND integration-test)
+
+  add_executable(connectivity-test test/connectivity_test.cpp)
+  target_link_libraries(connectivity-test PRIVATE connectivity_core)
+  target_include_directories(connectivity-test PRIVATE test)
+  target_compile_options(connectivity-test PRIVATE ${COMPASS_WARNINGS})
+  add_test(NAME connectivity-test COMMAND connectivity-test)
 endif()

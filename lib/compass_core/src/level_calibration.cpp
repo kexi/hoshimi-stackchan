@@ -115,6 +115,10 @@ LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count) {
     return calibration;
   }
   const double radius = std::sqrt(radiusSquared);
+  // invalid のまま返す場合も、UI が実際の中心を使って回転量を表示できるようにする。
+  calibration.offsetX = static_cast<float>(centerX);
+  calibration.offsetY = static_cast<float>(centerY);
+  calibration.radius = static_cast<float>(radius);
 
   // 円周をどれだけ覆えたか。半周しか回していないと中心がずれるので、
   // ここを見ないと不完全な回転を採用してしまう。
@@ -131,9 +135,11 @@ LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count) {
   // 外れ値を落とすと 11 度まで下がる。
   double radii[kMaxSamplesForMedian] = {};
   const std::size_t sampled = count < kMaxSamplesForMedian ? count : kMaxSamplesForMedian;
-  const std::size_t stride = count / sampled;
   for (std::size_t index = 0; index < sampled; ++index) {
-    const Vec3& point = points[index * stride];
+    // 先頭64点ではなく全期間から等間隔に選ぶ。サンプルは回転順なので、
+    // 65〜127点で先頭だけ取ると円周の片側へ偏る。
+    const std::size_t sourceIndex = index * (count - 1) / (sampled - 1);
+    const Vec3& point = points[sourceIndex];
     radii[index] = std::hypot(point.x - centerX, point.y - centerY);
   }
   // 挿入ソート。要素数が小さいので十分速い。
@@ -149,9 +155,11 @@ LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count) {
   const double medianRadius = radii[sampled / 2];
   const double outlierBand = 0.4 * medianRadius;
 
-  // X と Y の感度差を測る。円が楕円になっているぶんを揃える。
-  double sumX = 0.0;
-  double sumY = 0.0;
+  // 水平面の共分散から、楕円を円へ戻す対称な2x2変換を求める。
+  // 交差項まで見るので、センサー軸に対して回転した軟鉄歪みにも対応できる。
+  double sumXX = 0.0;
+  double sumXY = 0.0;
+  double sumYY = 0.0;
   std::size_t inlierCount = 0;
   for (std::size_t index = 0; index < count; ++index) {
     const double dx = points[index].x - centerX;
@@ -159,25 +167,34 @@ LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count) {
     if (std::fabs(std::hypot(dx, dy) - medianRadius) > outlierBand) {
       continue;
     }
-    sumX += dx * dx;
-    sumY += dy * dy;
+    sumXX += dx * dx;
+    sumXY += dx * dy;
+    sumYY += dy * dy;
     ++inlierCount;
   }
   if (inlierCount < 8) {
     return calibration;
   }
-  const double rmsX = std::sqrt(sumX / static_cast<double>(inlierCount));
-  const double rmsY = std::sqrt(sumY / static_cast<double>(inlierCount));
-  if (!(rmsX > 0.0) || !(rmsY > 0.0)) {
+  const double covarianceXX = sumXX / static_cast<double>(inlierCount);
+  const double covarianceXY = sumXY / static_cast<double>(inlierCount);
+  const double covarianceYY = sumYY / static_cast<double>(inlierCount);
+  const double trace = covarianceXX + covarianceYY;
+  const double discriminant = std::hypot(covarianceXX - covarianceYY, 2.0 * covarianceXY);
+  const double eigenHigh = 0.5 * (trace + discriminant);
+  const double eigenLow = 0.5 * (trace - discriminant);
+  const bool covarianceIsPositive = eigenHigh > 0.0 && eigenLow > 0.0;
+  if (!covarianceIsPositive) {
     return calibration;
   }
-  const double meanRms = 0.5 * (rmsX + rmsY);
-
-  calibration.offsetX = static_cast<float>(centerX);
-  calibration.offsetY = static_cast<float>(centerY);
-  calibration.scaleX = static_cast<float>(meanRms / rmsX);
-  calibration.scaleY = static_cast<float>(meanRms / rmsY);
-  calibration.radius = static_cast<float>(radius);
+  const double meanEigenvalue = 0.5 * trace;
+  const double highScale = std::sqrt(meanEigenvalue / eigenHigh);
+  const double lowScale = std::sqrt(meanEigenvalue / eigenLow);
+  const double principalAngle = 0.5 * std::atan2(2.0 * covarianceXY, covarianceXX - covarianceYY);
+  const double cosine = std::cos(principalAngle);
+  const double sine = std::sin(principalAngle);
+  calibration.scaleX = static_cast<float>(cosine * cosine * highScale + sine * sine * lowScale);
+  calibration.scaleY = static_cast<float>(sine * sine * highScale + cosine * cosine * lowScale);
+  calibration.crossAxis = static_cast<float>(cosine * sine * (highScale - lowScale));
 
   // 補正後の半径のばらつきで質を測る。外れ値は採否の判断からも除く。
   // 姿勢が揺れた点まで数えると、良いキャリブレーションでも残差が大きく出る。
@@ -190,7 +207,9 @@ LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count) {
     if (std::fabs(std::hypot(rawDx, rawDy) - medianRadius) > outlierBand) {
       continue;
     }
-    correctedRadiusSum += std::hypot(rawDx * calibration.scaleX, rawDy * calibration.scaleY);
+    const double correctedX = rawDx * calibration.scaleX + rawDy * calibration.crossAxis;
+    const double correctedY = rawDx * calibration.crossAxis + rawDy * calibration.scaleY;
+    correctedRadiusSum += std::hypot(correctedX, correctedY);
     ++scored;
   }
   if (scored == 0) {
@@ -206,8 +225,9 @@ LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count) {
     if (std::fabs(std::hypot(rawDx, rawDy) - medianRadius) > outlierBand) {
       continue;
     }
-    const double error =
-        std::hypot(rawDx * calibration.scaleX, rawDy * calibration.scaleY) - meanCorrected;
+    const double correctedX = rawDx * calibration.scaleX + rawDy * calibration.crossAxis;
+    const double correctedY = rawDx * calibration.crossAxis + rawDy * calibration.scaleY;
+    const double error = std::hypot(correctedX, correctedY) - meanCorrected;
     residualSum += error * error;
   }
   calibration.normalizedResidual =
@@ -223,8 +243,10 @@ Vec3 applyLevelCalibration(const LevelCalibration& calibration, Vec3 raw) {
     return raw;
   }
   Vec3 result;
-  result.x = (raw.x - calibration.offsetX) * calibration.scaleX;
-  result.y = (raw.y - calibration.offsetY) * calibration.scaleY;
+  const float centeredX = raw.x - calibration.offsetX;
+  const float centeredY = raw.y - calibration.offsetY;
+  result.x = centeredX * calibration.scaleX + centeredY * calibration.crossAxis;
+  result.y = centeredX * calibration.crossAxis + centeredY * calibration.scaleY;
   // Z は方位計算に使わないので素通し。水平回転では Z のオフセットが決まらない。
   result.z = raw.z;
   return result;

@@ -6,8 +6,9 @@
 // これを入れないと日本では 7-9 度ずれる。自分の土地の値は NOAA の計算機
 // (https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml) で得られる。
 //
-// 緯度経度は天体の位置計算に使う。数 km ずれても方位への影響は無視できるが、
-// 100km 単位でずれると効いてくる。
+// 緯度経度は天体の位置計算に使う。GeoIP有効時は取得値で上書きされ、失敗時は
+// NVSキャッシュ、さらにこの固定値へフォールバックする。GeoIPは概算なので、
+// 正確な設置地点が分かる場合はwifi_config.hでGEOIP_ENABLEDをfalseにする。
 
 // 千葉市付近
 inline constexpr double kSiteLatitudeDegrees = 35.607;

@@ -33,4 +33,6 @@ jobs:
       # devshell 丸ごと (platformio 込み) は重いので nix run で単体実行する。
       # --check: 未ピンの action があれば fail (修正はしない)
       # --verify: ピン済み SHA が注記のタグと本当に一致するかリモートに照合する
-      - run: nix run --inputs-from . nixpkgs#pinact -- run --check --verify
+      - run: nix run --inputs-from . nixpkgs#pinact -- run --fix=false --verify-comment --verify-min-age --min-age 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -8,14 +8,17 @@
 pre-commit:
   parallel: true
   commands:
+    justfile:
+      glob: "justfile"
+      run: nix develop --no-eval-cache --command just justfile-fmt-check
     format:
       glob: "*.{cpp,hpp,h}"
-      run: nix develop --command just fmt-check
+      run: nix develop --no-eval-cache --command just fmt-check
     tidy:
       glob: "{.clang-tidy,CMakeLists.txt,lib/**/*.{cpp,hpp},test/**/*.cpp}"
-      run: nix develop --command just lint
+      run: nix develop --no-eval-cache --command just lint
     actions:
       glob: ".github/workflows/*.{yml,yaml}"
-      run: nix develop --command just actions
+      run: nix develop --no-eval-cache --command just actions
     secrets:
-      run: nix develop --command just secrets-staged
+      run: nix develop --no-eval-cache --command just secrets-staged

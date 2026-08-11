@@ -15,10 +15,6 @@ enum class Phase : std::uint8_t {
   ConnectWifi,
   SyncTime,
   Calibrating,
-  // 首を左右に振って、角度ごとの磁気のずれを覚える。
-  // これが済むと、首を正面に戻さなくても方位が読めるようになり、
-  // 持ち歩きながら天体を指し続けられる。
-  LearningBias,
   Idle,
   // 首を正面へ戻す。ここを挟まないと、首の角度によって方位が最大 119 度ずれる
   // (段階 8 実測)。磁気測定の前提を揃えるための姿勢。
@@ -30,13 +26,6 @@ enum class Phase : std::uint8_t {
 };
 
 [[nodiscard]] const char* phaseName(Phase phase);
-
-// 首のクセを学習するときに通す角度の数。可動域を等分に掃く。
-// 16 ビンのうち半分以上を埋めたいので、それより多く採る。
-inline constexpr std::uint8_t kLearningStepCount = 12;
-
-// 学習の step 段目で首を向ける角度 [deci-degree]。
-[[nodiscard]] int learningYawFor(std::uint8_t step);
 
 // スワイプの向き。
 enum class Input : std::uint8_t {
@@ -71,6 +60,11 @@ struct Config {
   std::uint32_t measureTimeoutMillis = 8000;
   // 機体が動かされたと判断するジャイロのしきい値。
   float bodyMovedGyroDegPerSec = 30.0F;
+  // サーボ静止後、機体移動の判定へジャイロを使わない時間。
+  //
+  // 位置が止まっても顔側のIMUには慣性振動が残る。実機側の位置静穏判定
+  // 500msに加えてこの時間を待ち、首振りの余韻を本体移動と誤認しない。
+  std::uint32_t gyroAfterServoSettleMillis = 500;
 };
 
 // 実機・シミュレータの双方から同じ形で渡す入力。
@@ -92,10 +86,10 @@ struct Tick {
   float gyroMagnitudeDegPerSec = 0.0F;
   bool servoSettled = true;
 
-  // 首の角度によるずれを補正できるか (ServoBiasTable が学習済みか)。
+  // いま首が向いている角度のずれを覚えているか。
   //
   // 真なら首を正面へ戻さずに測れるので、指したまま追尾を続けられる。
-  // 持ち歩きながら観測するにはこれが要る。
+  // 持ち歩きながら観測するにはこれが要る。覚えていない角度では戻す。
   bool biasCorrected = false;
 };
 
@@ -107,6 +101,9 @@ struct State {
   std::uint32_t phaseEnteredMillis = 0;
   std::uint32_t lastMeasureMillis = 0;
   std::uint32_t lastTargetSwitchMillis = 0;
+  // サーボ動作を最後に観測した時刻。静止直後の慣性振動をジャイロ判定から
+  // 除外するため、局面に関係なく更新する。
+  std::uint32_t lastServoMotionMillis = 0;
 
   astro::TargetPosition lastPosition;
   pointing::SolveResult lastSolve;
@@ -124,9 +121,6 @@ struct State {
   // 首の角度によるずれを補正できるか。tick から写して持つ。
   // servoIntentFor() は State しか見ないので、ここに置く必要がある。
   bool biasCorrected = false;
-
-  // 学習中に首を振っている段階。0 から kLearningStepCount-1 まで進む。
-  std::uint8_t learningStep = 0;
 
   compass::MeasurementGate::Reject lastReject = compass::MeasurementGate::Reject::None;
 };

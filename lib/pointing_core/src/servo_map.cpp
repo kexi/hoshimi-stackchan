@@ -44,4 +44,13 @@ bool isPitchReachable(int pitchDeciDegrees) {
   return pitchDeciDegrees >= kPitchMinDeci && pitchDeciDegrees <= kPitchMaxDeci;
 }
 
+bool isServoAtTarget(int actualYawDeciDegrees, int actualPitchDeciDegrees, int targetYawDeciDegrees,
+                     int targetPitchDeciDegrees, int toleranceDeciDegrees) {
+  const bool yawReached =
+      std::abs(actualYawDeciDegrees - targetYawDeciDegrees) <= toleranceDeciDegrees;
+  const bool pitchReached =
+      std::abs(actualPitchDeciDegrees - targetPitchDeciDegrees) <= toleranceDeciDegrees;
+  return yawReached && pitchReached;
+}
+
 } // namespace pointing

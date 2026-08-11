@@ -5,9 +5,12 @@
 //  - 機体が動かされたら測り直しに戻る
 //  - millis() の 32bit wrap をまたいでも遷移が壊れない
 
+#include "app/presentation.hpp"
 #include "app/state.hpp"
 
 #include "test_support.hpp"
+
+#include <string_view>
 
 namespace {
 
@@ -19,7 +22,7 @@ astro::Observer tokyoObserver() {
 }
 
 // 2026-08-11 12:00 JST
-constexpr std::int64_t kNoonJst = 1786064400;
+constexpr std::int64_t kNoonJst = 1786417200;
 
 app::Tick healthyTick(std::uint32_t nowMillis) {
   app::Tick tick;
@@ -30,9 +33,19 @@ app::Tick healthyTick(std::uint32_t nowMillis) {
   tick.headingValid = true;
   tick.measurementAccepted = true;
   tick.servoSettled = true;
-  // 学習済みの定常状態を既定にする。学習そのものは専用のテストで見る。
+  // 補正済みの定常状態を既定にする。未補正の経路は専用の入力で見る。
   tick.biasCorrected = true;
   return tick;
+}
+
+std::size_t utf8CodePointCount(std::string_view text) {
+  std::size_t count = 0;
+  for (const char character : text) {
+    const auto byte = static_cast<unsigned char>(character);
+    const bool isContinuationByte = (byte & 0xC0U) == 0x80U;
+    count += static_cast<std::size_t>(!isContinuationByte);
+  }
+  return count;
 }
 
 // 首のクセをまだ覚えていない状態。首を正面へ戻さないと方位が読めない。
@@ -51,20 +64,9 @@ void advanceUntil(app::State& state, app::Phase wanted, std::uint32_t& clock,
   }
 }
 
-// 学習は済ませた上で、補正を使わない状態から進める。
-//
-// LearningBias は補正が無い限り抜けないので、いったん補正ありで追尾まで
-// 進めてから補正を外す。実機で言えば「覚えた表が使えなくなった」状況。
-// 再測定の周期は長いので、機体を動かして測り直しの契機を作る。
+// 補正を使えない状態から、指定した局面まで進める。
 void advanceUncorrected(app::State& state, app::Phase wanted, std::uint32_t& clock,
                         const app::Config& config) {
-  advanceUntil(state, app::Phase::Tracking, clock, config);
-
-  clock += 200;
-  app::Tick shaken = uncorrectedTick(clock);
-  shaken.gyroMagnitudeDegPerSec = 120.0F;
-  app::step(state, shaken, config, tokyoObserver());
-
   for (int guard = 0; guard < 500 && state.phase != wanted; ++guard) {
     clock += 200;
     app::step(state, uncorrectedTick(clock), config, tokyoObserver());
@@ -272,44 +274,58 @@ void testBodyMovementTriggersRemeasure() {
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 }
 
-void testLearningSweepsNeckAcrossRange() {
-  // 首のクセを覚える局面が、可動域を端まで掃くこと。
-  //
-  // 16 ビンのうち半分以上を埋めないと補正として使えないので、
-  // 特定の角度だけ通っても足りない。
-  const int first = app::learningYawFor(0);
-  CHECK_TRUE(first == compass::kMeasurementYawDeci);
+void testServoMotionDoesNotTriggerRemeasure() {
+  // CoreS3のIMUは顔側にあるため、首を動かすだけでもジャイロが反応する。
+  // サーボ稼働中と停止直後の慣性振動を本体移動と誤認せず、十分に静穏な
+  // 時間が過ぎてからは実際の本体移動を検出することを保証する。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
 
-  int minYaw = first;
-  int maxYaw = first;
-  for (std::uint8_t step = 0; step < app::kLearningStepCount; ++step) {
-    const int yaw = app::learningYawFor(step);
-    CHECK_TRUE(pointing::isYawReachable(yaw));
-    minYaw = yaw < minYaw ? yaw : minYaw;
-    maxYaw = yaw > maxYaw ? yaw : maxYaw;
-  }
-  CHECK_TRUE(minYaw == pointing::kYawMinDeci);
-  CHECK_TRUE(maxYaw == pointing::kYawMaxDeci);
+  clock += 200;
+  app::Tick servoMotion = healthyTick(clock);
+  servoMotion.biasCorrected = false;
+  servoMotion.servoSettled = false;
+  servoMotion.gyroMagnitudeDegPerSec = 120.0F;
+  app::step(state, servoMotion, config, tokyoObserver());
+
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+  CHECK_TRUE(state.hasSolve);
+
+  clock += config.gyroAfterServoSettleMillis - 1;
+  app::Tick inertia = healthyTick(clock);
+  inertia.biasCorrected = false;
+  inertia.servoSettled = true;
+  inertia.gyroMagnitudeDegPerSec = 120.0F;
+  app::step(state, inertia, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+
+  clock += 1;
+  app::Tick bodyMotion = healthyTick(clock);
+  bodyMotion.biasCorrected = false;
+  bodyMotion.servoSettled = true;
+  bodyMotion.gyroMagnitudeDegPerSec = 120.0F;
+  app::step(state, bodyMotion, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 }
 
-void testLearningPhaseRunsBeforeIdle() {
-  // 首のクセを覚えていなければ、追尾に入る前に学習へ寄ること。
+void testIncompleteBiasLearningDoesNotBlockNorth() {
+  // 首の補正表が空でも、正面で方位を採れば真北を指せること。
+  // 補正表の完成を起動条件にすると、端のサーボが区画へ届かない個体では
+  // 学習が永久に終わらず、基本機能の真北を一度も指せない。
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
 
-  for (int step = 0; step < 40 && state.phase != app::Phase::LearningBias; ++step) {
+  for (int step = 0; step < 80 && state.phase != app::Phase::Tracking; ++step) {
     clock += 200;
-    app::Tick tick = healthyTick(clock);
-    tick.biasCorrected = false;
-    app::step(state, tick, config, tokyoObserver());
+    app::step(state, uncorrectedTick(clock), config, tokyoObserver());
   }
-  CHECK_TRUE(state.phase == app::Phase::LearningBias);
-
-  // 覚え終われば先へ進む
-  clock += 200;
-  app::step(state, healthyTick(clock), config, tokyoObserver());
-  CHECK_TRUE(state.phase == app::Phase::Idle);
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+  CHECK_TRUE(state.target == astro::Target::North);
+  CHECK_TRUE(state.hasSolve);
 }
 
 void testBiasCorrectedTrackingSurvivesMovement() {
@@ -509,6 +525,49 @@ void testMeasurePoseSettleIsRespected() {
   CHECK_TRUE(state.phase == app::Phase::Measuring);
 }
 
+void testFaceSpeechNamesTargetAndFitsBalloon() {
+  // 全対象の案内が、地平線下と可動域外のどちらでも対象名を明示し、
+  // Avatarの吹き出しに収まる6文字以内であることを保証する。
+  for (std::uint8_t index = 0; index < static_cast<std::uint8_t>(astro::Target::kCount); ++index) {
+    app::State state;
+    state.phase = app::Phase::Tracking;
+    state.target = static_cast<astro::Target>(index);
+    state.lastPosition.valid = true;
+    state.lastPosition.aboveHorizon = false;
+    state.lastSolve.command.clampedYaw = true;
+    state.lastSolve.command.clampedPitch = true;
+
+    const std::string_view targetName = app::targetNameJapanese(state.target);
+    const app::FacePresentation below = app::facePresentationFor(state, 1.0F);
+    const std::string_view belowSpeech = below.speech.data();
+    CHECK_TRUE(below.mood == app::FaceMood::Sleepy);
+    CHECK_TRUE(belowSpeech.rfind(targetName, 0) == 0);
+    CHECK_TRUE(belowSpeech.find("は地平下") != std::string_view::npos);
+    CHECK_TRUE(utf8CodePointCount(belowSpeech) <= 6);
+
+    state.lastPosition.aboveHorizon = true;
+    const app::FacePresentation behind = app::facePresentationFor(state, 1.0F);
+    const std::string_view behindSpeech = behind.speech.data();
+    CHECK_TRUE(behind.mood == app::FaceMood::Doubt);
+    CHECK_TRUE(behindSpeech.rfind(targetName, 0) == 0);
+    CHECK_TRUE(behindSpeech.find("はうしろ") != std::string_view::npos);
+    CHECK_TRUE(utf8CodePointCount(behindSpeech) <= 6);
+
+    state.lastSolve.command.clampedYaw = false;
+    const app::FacePresentation above = app::facePresentationFor(state, 1.0F);
+    const std::string_view aboveSpeech = above.speech.data();
+    CHECK_TRUE(above.mood == app::FaceMood::Doubt);
+    CHECK_TRUE(aboveSpeech.rfind(targetName, 0) == 0);
+    CHECK_TRUE(aboveSpeech.find("は上すぎ") != std::string_view::npos);
+    CHECK_TRUE(utf8CodePointCount(aboveSpeech) <= 6);
+
+    state.lastSolve.command.clampedPitch = false;
+    const app::FacePresentation pointing = app::facePresentationFor(state, 1.0F);
+    CHECK_TRUE(pointing.mood == app::FaceMood::Happy);
+    CHECK_TRUE(utf8CodePointCount(pointing.speech.data()) <= 6);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -516,6 +575,7 @@ int main() {
   testPointingDoesNotReissueCommandForever();
   testMeasurePoseSettleOutlastsServoTravel();
   testMeasurePoseSettleIsRespected();
+  testFaceSpeechNamesTargetAndFitsBalloon();
   testBootReachesTracking();
   testCalibrationGate();
   testTimeInvalidStillPointsNorth();
@@ -525,8 +585,8 @@ int main() {
   testTrackingStaysWhileNeckIsAway();
   testTrackingEscapesWhenHeadingWasNeverTaken();
   testBodyMovementTriggersRemeasure();
-  testLearningSweepsNeckAcrossRange();
-  testLearningPhaseRunsBeforeIdle();
+  testServoMotionDoesNotTriggerRemeasure();
+  testIncompleteBiasLearningDoesNotBlockNorth();
   testBiasCorrectedTrackingSurvivesMovement();
   testBiasCorrectedSkipsMeasurePose();
   testMillisWrapDoesNotBreakTransitions();

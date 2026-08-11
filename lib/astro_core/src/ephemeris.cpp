@@ -1,5 +1,6 @@
 #include "astro/ephemeris.hpp"
 
+#include "astro/ephemeris_db.hpp"
 #include "astro/moon.hpp"
 #include "astro/planets.hpp"
 #include "astro/sun.hpp"
@@ -7,6 +8,36 @@
 
 namespace astro {
 namespace {
+
+bool targetAsEphemerisBody(Target target, EphemerisBody& bodyOut) {
+  switch (target) {
+  case Target::Sun:
+    bodyOut = EphemerisBody::Sun;
+    return true;
+  case Target::Moon:
+    bodyOut = EphemerisBody::Moon;
+    return true;
+  case Target::Mercury:
+    bodyOut = EphemerisBody::Mercury;
+    return true;
+  case Target::Venus:
+    bodyOut = EphemerisBody::Venus;
+    return true;
+  case Target::Mars:
+    bodyOut = EphemerisBody::Mars;
+    return true;
+  case Target::Jupiter:
+    bodyOut = EphemerisBody::Jupiter;
+    return true;
+  case Target::Saturn:
+    bodyOut = EphemerisBody::Saturn;
+    return true;
+  case Target::North:
+  case Target::kCount:
+    return false;
+  }
+  return false;
+}
 
 bool targetIsPlanet(Target target, Planet& planetOut) {
   switch (target) {
@@ -56,6 +87,20 @@ const char* targetName(Target target) {
   return "?";
 }
 
+const char* ephemerisSourceName(EphemerisSource source) {
+  switch (source) {
+  case EphemerisSource::None:
+    return "none";
+  case EphemerisSource::FixedDirection:
+    return "fixed";
+  case EphemerisSource::HighPrecisionDatabase:
+    return "jpl-db";
+  case EphemerisSource::ApproximateModel:
+    return "approx";
+  }
+  return "?";
+}
+
 TargetPosition computeTargetPosition(Target target, std::int64_t unixSeconds, Observer observer,
                                      bool timeValid) {
   TargetPosition result;
@@ -66,6 +111,7 @@ TargetPosition computeTargetPosition(Target target, std::int64_t unixSeconds, Ob
     result.horizontal.altitudeDegrees = 0.0;
     result.aboveHorizon = true;
     result.valid = true;
+    result.source = EphemerisSource::FixedDirection;
     return result;
   }
 
@@ -78,15 +124,27 @@ TargetPosition computeTargetPosition(Target target, std::int64_t unixSeconds, Ob
       localApparentSiderealTimeDegrees(julianDate, observer.longitudeEastDegrees);
 
   EquatorialCoord equatorial;
-  Planet planet = Planet::Mercury;
-  if (target == Target::Sun) {
-    equatorial = sunEquatorial(julianDate);
-  } else if (target == Target::Moon) {
-    equatorial = moonEquatorial(julianDate);
-  } else if (targetIsPlanet(target, planet)) {
-    equatorial = planetEquatorial(planet, julianDate);
+  EphemerisBody databaseBody = EphemerisBody::Sun;
+  const bool hasDatabaseBody = targetAsEphemerisBody(target, databaseBody);
+  const bool hasDatabasePosition =
+      hasDatabaseBody && lookupHighPrecisionEquatorial(databaseBody, unixSeconds, equatorial);
+  if (hasDatabasePosition) {
+    result.source = EphemerisSource::HighPrecisionDatabase;
   } else {
-    return result;
+    Planet planet = Planet::Mercury;
+    const bool isSun = target == Target::Sun;
+    const bool isMoon = target == Target::Moon;
+    const bool isPlanet = targetIsPlanet(target, planet);
+    if (isSun) {
+      equatorial = sunEquatorial(julianDate);
+    } else if (isMoon) {
+      equatorial = moonEquatorial(julianDate);
+    } else if (isPlanet) {
+      equatorial = planetEquatorial(planet, julianDate);
+    } else {
+      return result;
+    }
+    result.source = EphemerisSource::ApproximateModel;
   }
 
   // 月は視差が最大 1 度に達するので、地心のままでは方位精度 0.1 度を満たせない。

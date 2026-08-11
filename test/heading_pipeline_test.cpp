@@ -12,6 +12,7 @@
 #include "compass/calibration.hpp"
 #include "compass/declination.hpp"
 #include "compass/heading.hpp"
+#include "compass/level_calibration.hpp"
 #include "compass/stability.hpp"
 
 #include "test_support.hpp"
@@ -28,6 +29,9 @@ constexpr float kDeclinationEast = -7.9F;
 // 実機と同じ順序で方位を確定させる。ファームの loop() の写し。
 class HeadingPipeline {
 public:
+  explicit HeadingPipeline(compass::LevelCalibration calibration = {})
+      : calibration_(calibration) {}
+
   struct Sample {
     compass::Vec3 mag;
     compass::Vec3 accel{0.0F, 0.0F, 1.0F};
@@ -42,9 +46,10 @@ public:
     if (!poseIsClean) {
       return;
     }
-    const compass::Vec3 corrected = compass::applyCalibration(calibration_, sample.mag);
     const compass::Attitude attitude = compass::attitudeFromAccel(sample.accel);
-    filter_.update(compass::tiltCompensatedHeadingDegrees(corrected, attitude));
+    const compass::Vec3 horizontal = compass::horizontalMagneticComponents(sample.mag, attitude);
+    const compass::Vec3 corrected = compass::applyLevelCalibration(calibration_, horizontal);
+    filter_.update(compass::headingDegreesFromHorizontal(corrected));
   }
 
   // ファームの commandServo() 相当。姿勢が変わるときだけ捨てる。
@@ -63,18 +68,28 @@ public:
 
   // ファームの loop() 後半 (ゲート判定と採用) 相当。
   void evaluate(const Sample& sample) {
+    const compass::Attitude attitude = compass::attitudeFromAccel(sample.accel);
+    const compass::Vec3 horizontal = compass::horizontalMagneticComponents(sample.mag, attitude);
+    const compass::Vec3 corrected = compass::applyLevelCalibration(calibration_, horizontal);
+
     compass::MeasurementGate::Input input;
     input.nowMillis = sample.nowMillis;
     input.servoMoving = sample.servoMoving;
     input.lastServoStopMillis = sample.nowMillis - 5000;
     input.gyroMagnitudeDegPerSec = 0.1F;
-    input.fieldMagnitudeMicroTesla = compass::magnitude(sample.mag);
+    input.fieldMagnitudeMicroTesla = compass::magnitude(corrected);
     input.headingDispersionDegrees = filter_.dispersionDegrees();
     input.yawDeciDegrees = sample.commandedYaw;
 
-    const bool accepted =
-        gate_.evaluate(input) == compass::MeasurementGate::Reject::None && filter_.hasValue();
-    if (!accepted) {
+    constexpr std::size_t kMinimumSamples = 8;
+    const bool accepted = gate_.evaluate(input) == compass::MeasurementGate::Reject::None;
+    const bool filterConverged = filter_.hasConverged(kMinimumSamples);
+    const bool canLearnReference = accepted && filterConverged;
+    if (canLearnReference) {
+      gate_.learnReferenceField(input.fieldMagnitudeMicroTesla);
+    }
+    const bool headingCanBeUsed = accepted && filterConverged;
+    if (!headingCanBeUsed) {
       return;
     }
     bodyTrueHeading_ = compass::trueHeadingFromMagnetic(filter_.valueDegrees(), kDeclinationEast);
@@ -84,9 +99,11 @@ public:
   [[nodiscard]] bool headingValid() const { return headingValid_; }
   [[nodiscard]] float bodyTrueHeading() const { return bodyTrueHeading_; }
   [[nodiscard]] int commandedYaw() const { return commandedYaw_; }
+  [[nodiscard]] bool hasReferenceField() const { return gate_.hasReferenceField(); }
+  [[nodiscard]] float referenceField() const { return gate_.referenceFieldMicroTesla(); }
 
 private:
-  compass::MagCalibration calibration_;
+  compass::LevelCalibration calibration_;
   compass::MeasurementGate gate_;
   compass::HeadingFilter filter_{0.25F};
   int commandedYaw_ = 0;
@@ -120,6 +137,31 @@ void testCleanPoseProducesCorrectHeading() {
   CHECK_TRUE(pipeline.headingValid());
   // 磁北を向いていて西偏 7.9 度なら、真方位は 352.1 度
   CHECK_NEAR_ANGLE(pipeline.bodyTrueHeading(), 352.1, 0.5);
+}
+
+void testPipelineAppliesLevelCalibration() {
+  // ファームと同じ経路が、水平回転で得たオフセットを実際の方位へ適用すること。
+  compass::LevelCalibration calibration;
+  calibration.offsetX = 120.0F;
+  calibration.offsetY = -85.0F;
+  calibration.scaleX = 1.0F;
+  calibration.scaleY = 1.0F;
+  calibration.valid = true;
+  HeadingPipeline pipeline{calibration};
+
+  HeadingPipeline::Sample sample;
+  sample.mag = fieldForHeading(90.0F);
+  sample.mag.x += calibration.offsetX;
+  sample.mag.y += calibration.offsetY;
+  sample.commandedYaw = 0;
+  sample.nowMillis = 10000;
+  for (int step = 0; step < 40; ++step) {
+    pipeline.ingest(sample);
+    pipeline.evaluate(sample);
+  }
+
+  CHECK_TRUE(pipeline.headingValid());
+  CHECK_NEAR_ANGLE(pipeline.bodyTrueHeading(), 82.1, 0.5);
 }
 
 void testTurnedPoseIsIgnoredEntirely() {
@@ -259,11 +301,43 @@ void testMeasureWindowAccumulatesEnoughSamples() {
   CHECK_TRUE(millisFor8 < static_cast<float>(kMeasureWindowMillis));
 }
 
+void testReferenceFieldWaitsForConvergedHeading() {
+  // 起動直後の過渡値1点を磁場基準にせず、8サンプル収束後の定常値を覚えること。
+  HeadingPipeline pipeline;
+  HeadingPipeline::Sample transient;
+  transient.mag = fieldForHeading(0.0F);
+  transient.mag.x *= 2.0F;
+  transient.mag.y *= 2.0F;
+  transient.commandedYaw = 0;
+  transient.nowMillis = 10000;
+
+  pipeline.ingest(transient);
+  pipeline.evaluate(transient);
+  CHECK_TRUE(!pipeline.hasReferenceField());
+
+  HeadingPipeline::Sample steady;
+  steady.mag = fieldForHeading(0.0F);
+  steady.commandedYaw = 0;
+  steady.nowMillis = 11000;
+  for (int step = 0; step < 40; ++step) {
+    pipeline.ingest(steady);
+    pipeline.evaluate(steady);
+  }
+
+  const compass::Attitude attitude = compass::attitudeFromAccel(steady.accel);
+  const float expected =
+      compass::magnitude(compass::horizontalMagneticComponents(steady.mag, attitude));
+  CHECK_TRUE(pipeline.hasReferenceField());
+  CHECK_NEAR(pipeline.referenceField(), expected, 0.5);
+}
+
 } // namespace
 
 int main() {
+  testReferenceFieldWaitsForConvergedHeading();
   testMeasureWindowAccumulatesEnoughSamples();
   testCleanPoseProducesCorrectHeading();
+  testPipelineAppliesLevelCalibration();
   testTurnedPoseIsIgnoredEntirely();
   testReturnToPoseRecoversCleanHeading();
   testMovingServoNeverContributes();

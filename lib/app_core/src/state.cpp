@@ -60,19 +60,6 @@ bool applyInput(State& state, const Tick& tick) {
 
 } // namespace
 
-int learningYawFor(std::uint8_t step) {
-  // まず正面。ここで測った方位が、他の角度のずれを測るときの基準になる。
-  if (step == 0 || step >= kLearningStepCount) {
-    return compass::kMeasurementYawDeci;
-  }
-  // 残りで可動域 (-1280..1280) を等分に掃く。端まで舐めれば 16 ビンのうち
-  // 半分以上が埋まる。
-  constexpr int kSpan = pointing::kYawMaxDeci - pointing::kYawMinDeci;
-  const int sweepIndex = static_cast<int>(step) - 1;
-  const int sweepCount = static_cast<int>(kLearningStepCount) - 2;
-  return pointing::kYawMinDeci + kSpan * sweepIndex / sweepCount;
-}
-
 const char* phaseName(Phase phase) {
   switch (phase) {
   case Phase::InitHardware:
@@ -83,8 +70,6 @@ const char* phaseName(Phase phase) {
     return "SyncTime";
   case Phase::Calibrating:
     return "Calibrating";
-  case Phase::LearningBias:
-    return "LearningBias";
   case Phase::Idle:
     return "Idle";
   case Phase::ReturningToMeasurePose:
@@ -103,14 +88,6 @@ const char* phaseName(Phase phase) {
 
 ServoIntent servoIntentFor(const State& state) {
   ServoIntent intent;
-
-  // 学習中は首を順に振る。各角度で磁気を測り、正面との差を覚える。
-  if (state.phase == Phase::LearningBias) {
-    intent.yawDeciDegrees = learningYawFor(state.learningStep);
-    intent.pitchDeciDegrees = pointing::kPitchLevelDeci;
-    intent.shouldMove = true;
-    return intent;
-  }
 
   // 測定に関わる局面では、首を必ず正面へ。これがノイズ対策の本体。
   //
@@ -165,6 +142,12 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
   state.lastReject = tick.lastReject;
   state.biasCorrected = tick.biasCorrected;
 
+  // どの局面で首が動いても、静止後の慣性待ちをTrackingへ引き継ぐ。
+  const bool servoIsMoving = !tick.servoSettled;
+  if (servoIsMoving) {
+    state.lastServoMotionMillis = tick.nowMillis;
+  }
+
   // 入力はどの状態でも受け付ける。ターゲットが変われば測り直しから入る。
   const bool targetChanged = applyInput(state, tick);
   const bool isInteractive = state.phase == Phase::Idle || state.phase == Phase::Tracking ||
@@ -190,46 +173,17 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
       enterPhase(state, Phase::Calibrating, tick.nowMillis);
       return;
     }
-    // キャリブレーション済みでも、首のクセを覚えていなければ先に学習する。
-    state.learningStep = 0;
-    enterPhase(state, tick.biasCorrected ? Phase::Idle : Phase::LearningBias, tick.nowMillis);
+    // 地磁気のキャリブレーションが済んでいれば、まず正面で方位を採る。
+    // 首角度ごとの補正は、指した先で実測できた区画から徐々に覚える。
+    enterPhase(state, Phase::Idle, tick.nowMillis);
     return;
 
   case Phase::Calibrating:
     // 水平回しが終わる (呼び出し側が calibrationValid を立てる) まで留まる。
     if (tick.calibrationValid) {
-      // 続けて首のクセを覚える。これが済むと首を正面へ戻さずに測れるので、
-      // 持ち歩きながら指し続けられる。
-      state.learningStep = 0;
-      enterPhase(state, tick.biasCorrected ? Phase::Idle : Phase::LearningBias, tick.nowMillis);
-    }
-    return;
-
-  case Phase::LearningBias: {
-    // 学習が足りたら抜ける。呼び出し側が各角度で観測を積む。
-    if (tick.biasCorrected) {
       enterPhase(state, Phase::Idle, tick.nowMillis);
-      return;
     }
-
-    // 首が目標へ着いて磁場が落ち着くまで待ち、次の角度へ進む。
-    const bool settled =
-        elapsedSince(tick.nowMillis, state.phaseEnteredMillis) >= config.measurePoseSettleMillis;
-    if (!settled) {
-      return;
-    }
-    if (state.learningStep + 1 < kLearningStepCount) {
-      ++state.learningStep;
-      state.phaseEnteredMillis = tick.nowMillis;
-      return;
-    }
-
-    // 一周しても足りなければ、もう一周する。実機では角度によって
-    // 磁場が安定せず、観測が採れないビンが出る。
-    state.learningStep = 0;
-    state.phaseEnteredMillis = tick.nowMillis;
     return;
-  }
 
   case Phase::Idle:
     enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
@@ -311,7 +265,17 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     // バイアス表があるなら戻らない。首を振ったままでも方位が読めるので、
     // 追尾に留まったまま更新できる。持ち歩いている間は常に動いているので、
     // ここで測定へ戻すと指すことも測ることもできなくなる。
-    const bool bodyMoved = tick.gyroMagnitudeDegPerSec > config.bodyMovedGyroDegPerSec;
+    // CoreS3のIMUは顔側にあるので、首を動かすだけでもジャイロは反応する。
+    // サーボが静定し、さらに慣性振動が収まった周期だけを、本体が
+    // 持ち上げられた可能性として扱う。
+    //
+    // Why not servoSettledだけを見る: 位置が止まった直後も機構の慣性で顔側の
+    // IMUは揺れる。その値を拾うと、正常な首振りを本体移動と誤認する。
+    const bool gyroShowsMovement = tick.gyroMagnitudeDegPerSec > config.bodyMovedGyroDegPerSec;
+    const bool servoInertiaSettled =
+        tick.servoSettled && elapsedSince(tick.nowMillis, state.lastServoMotionMillis) >=
+                                 config.gyroAfterServoSettleMillis;
+    const bool bodyMoved = servoInertiaSettled && gyroShowsMovement;
     if (bodyMoved && !state.biasCorrected) {
       enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;

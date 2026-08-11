@@ -38,6 +38,7 @@
             actionlint
             clang-tools
             cmake
+            curl
             findutils
             git
             gitleaks
@@ -46,7 +47,10 @@
             ninja
             pinact
             platformio
+            python3
+            python3Packages.pyserial
             ripgrep
+            uv
           ];
 
           shellHook = ''
@@ -54,11 +58,41 @@
             export PLATFORMIO_CORE_DIR="$PWD/.platformio"
             export PYTHONPATH="${pioEsptoolPath}''${PYTHONPATH:+:$PYTHONPATH}"
 
-            # devShell に入るたび、リポジトリ管理の pre-commit hook を同期する。
+            # 初回だけリポジトリ管理のpre-commit hookを入れる。フック内では複数の
+            # nix developが並列に走るため、毎回installすると同じhookのrenameが競合する。
             if git rev-parse --git-dir >/dev/null 2>&1; then
-              lefthook install >/dev/null
+              hook_path="$(git rev-parse --git-path hooks/pre-commit)"
+              if [ ! -f "$hook_path" ] || ! grep -q lefthook "$hook_path"; then
+                lefthook install >/dev/null
+              fi
             fi
           '';
         };
+
+        formatter = pkgs.nixpkgs-fmt;
+
+        # flake check 自体でも、開発に必須なツール集合が評価・実行できることを確認する。
+        checks.toolchain = pkgs.runCommand "compass-stackchan-toolchain-check"
+          {
+            nativeBuildInputs = with pkgs; [
+              actionlint
+              clang-tools
+              cmake
+              gitleaks
+              just
+              pinact
+              python3
+            ];
+          } ''
+          {
+            just --version
+            cmake --version
+            clang-tidy --version
+            python3 --version
+            actionlint --version
+            gitleaks version
+            pinact version
+          } > "$out"
+        '';
       });
 }

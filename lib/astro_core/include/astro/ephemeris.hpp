@@ -21,11 +21,21 @@ enum class Target : std::uint8_t {
 
 [[nodiscard]] const char* targetName(Target target);
 
+enum class EphemerisSource : std::uint8_t {
+  None = 0,
+  FixedDirection,
+  HighPrecisionDatabase,
+  ApproximateModel,
+};
+
+[[nodiscard]] const char* ephemerisSourceName(EphemerisSource source);
+
 struct TargetPosition {
   HorizontalCoord horizontal;
   bool aboveHorizon = false;
   // 時刻が未同期のとき、天体は解けない (North だけは常に解ける)。
   bool valid = false;
+  EphemerisSource source = EphemerisSource::None;
 };
 
 // ファームウェアから見た唯一の入口。

@@ -18,16 +18,17 @@ namespace compass {
 // 実機で首を固定して測ったときの方位のばらつきは 1.9 度で、地磁気は
 // きちんと読めていた。
 //
-// コンパスに要るのは水平成分だけ (方位は atan2(y, x) で出る) なので、
-// 水平面の円さえ取れれば足りる。傾けたときの補正は加速度計による
-// 傾斜補正が担う。
+// 生センサーX/Yへ直接当てるのではなく、加速度計の姿勢で水平座標へ投影した
+// X/Yに対して使う。そうすれば傾いたCoreS3でも、固定磁石は一定の中心、
+// 地磁気の水平成分は円として観測できる。
 struct LevelCalibration {
-  // 水平面のハードアイアン。Z は水平回転では決まらないので触らない。
+  // 水平投影後のハードアイアン。
   float offsetX = 0.0F;
   float offsetY = 0.0F;
-  // X と Y の感度差。円が楕円になっているぶんを揃える。
+  // X と Y の感度差。crossAxisも使い、軸に対して回転した楕円も円へ戻す。
   float scaleX = 1.0F;
   float scaleY = 1.0F;
+  float crossAxis = 0.0F;
   float radius = 0.0F;
   // 円にどれだけ乗っているか。0 に近いほど良い。
   float normalizedResidual = 1.0F;
@@ -38,7 +39,7 @@ struct LevelCalibration {
 // 点が円周に十分散らばっていないと invalid を返す。
 [[nodiscard]] LevelCalibration fitLevelCircle(const Vec3* points, std::size_t count);
 
-// 水平補正を当てる。Z は素通し (方位計算では使わない)。
+// 水平投影済みのX/Yへ補正を当てる。Zは方位計算に使わない。
 [[nodiscard]] Vec3 applyLevelCalibration(const LevelCalibration& calibration, Vec3 raw);
 
 // 集めた点が円周のどれだけを覆っているか [0..1]。

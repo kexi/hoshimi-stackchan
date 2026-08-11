@@ -3,8 +3,16 @@
 // このファイルを wifi_config.h にコピーして、自分の環境の値を入れる。
 // wifi_config.h は .gitignore 済み (認証情報をコミットしないため)。
 //
-// Wi-Fi は NTP で時刻を取るためだけに使う。設定しなくても動くが、
-// その場合は天体が解けず、真北しか指せない。
+// Wi-FiはNTP時刻同期、mDNS、GeoIPに使う。設定しなくてもRTCと固定観測地で動く。
 
 #define WIFI_SSID "your-ssid"
 #define WIFI_PASSWORD "your-password"
+
+// NTP同期後は同じ時刻をRTCへ残すため、次回はオフラインでも天体を指せる。
+#define NTP_SERVER_1 "ntp.nict.jp"
+#define NTP_SERVER_2 "pool.ntp.org"
+
+// GeoIPはIPアドレス由来の概算位置。正確な設置地点をlocation_config.hへ設定する
+// 場合や、外部サービスへ接続したくない場合はfalseにする。
+#define GEOIP_ENABLED true
+#define GEOIP_URL "https://ipwho.is/?fields=success,latitude,longitude"

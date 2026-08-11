@@ -9,6 +9,7 @@
 #include "astro/angles.hpp"
 #include "astro/coords.hpp"
 #include "astro/ephemeris.hpp"
+#include "astro/ephemeris_db.hpp"
 #include "astro/moon.hpp"
 #include "astro/planets.hpp"
 #include "astro/sun.hpp"
@@ -16,7 +17,9 @@
 
 #include "test_support.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace {
 
@@ -296,9 +299,8 @@ void testMoonParallaxMatters() {
 void testPlanetAccuracy() {
   // Meeus 例題 33.a: 金星, 1992-12-20 0h TD (JDE 2448976.5) の視位置。
   //
-  // 許容値 0.12 度は「JPL 近似要素法の実力」であって目標値ではない。
-  // 完全な VSOP87 なら 1 秒角級だが、係数表が数千行になり ESP32 では割に合わない。
-  // サーボの分解能が 0.3125 度なので、この誤差は機械側に埋もれる。
+  // この関数はDB期間外でも使うフォールバックの精度を保証する。
+  // 主経路のJPL DBは testEphemerisDatabase() で別に厳しく検証する。
   const astro::JulianDate example33{2448976.5};
   const astro::EquatorialCoord venus = astro::planetEquatorial(astro::Planet::Venus, example33);
 
@@ -306,6 +308,32 @@ void testPlanetAccuracy() {
   expected.rightAscensionDegrees = 316.172725;
   expected.declinationDegrees = -18.887956;
   CHECK_TRUE(angularSeparationDegrees(venus, expected) < 0.12);
+
+  // JPL Horizons の地心・視位置スナップショットに対し、水星から土星まで
+  // すべての惑星方向が 0.25 度以内であること。
+  //
+  // 設定: 2026-08-11 10:00 UTC、CENTER=500@399、QUANTITIES=2、
+  // ANG_FORMAT=DEG、APPARENT=AIRLESS。JPL は DE441 を使用している。
+  // https://ssd.jpl.nasa.gov/api/horizons.api
+  const astro::JulianDate jplSnapshot = astro::julianDateFromUnixSeconds(1786442400);
+  struct ExpectedPlanetPosition {
+    astro::Planet planet;
+    double rightAscensionDegrees;
+    double declinationDegrees;
+  };
+  const ExpectedPlanetPosition expectedPositions[] = {
+      {astro::Planet::Mercury, 125.199832637, 19.871060214},
+      {astro::Planet::Venus, 183.826852774, -2.746190166},
+      {astro::Planet::Mars, 90.044967320, 23.673991423},
+      {astro::Planet::Jupiter, 131.834389241, 18.412035514},
+      {astro::Planet::Saturn, 14.385869941, 3.359910072},
+  };
+  for (const ExpectedPlanetPosition& expectedPosition : expectedPositions) {
+    const astro::EquatorialCoord actual =
+        astro::planetEquatorial(expectedPosition.planet, jplSnapshot);
+    CHECK_NEAR_ANGLE(actual.rightAscensionDegrees, expectedPosition.rightAscensionDegrees, 0.25);
+    CHECK_NEAR(actual.declinationDegrees, expectedPosition.declinationDegrees, 0.25);
+  }
 
   // 各惑星の地心距離が既知の範囲に収まること (要素表の取り違えを検出する)
   struct DistanceRange {
@@ -326,6 +354,44 @@ void testPlanetAccuracy() {
       CHECK_TRUE(position.distanceAu < range.maxAu);
     }
   }
+}
+
+void testEphemerisDatabase() {
+  const astro::EphemerisDatabaseInfo& info = astro::ephemerisDatabaseInfo();
+  CHECK_TRUE(info.startUnixSeconds == 1735689600); // 2025-01-01T00:00:00Z
+  CHECK_TRUE(info.stopUnixSeconds == 1924992000);  // 2031-01-01T00:00:00Z
+  CHECK_TRUE(info.dataCrc32 != 0);
+  CHECK_TRUE(std::strstr(info.source, "true-equator/equinox-of-date UT") != nullptr);
+
+  struct JplDatabaseExpected {
+    astro::EphemerisBody body;
+    std::int64_t unixSeconds;
+    double rightAscensionDegrees;
+    double declinationDegrees;
+    double distanceAu;
+  };
+#include "data/jpl_ephemeris_validation.inc"
+
+  // DB格子とは一致しない時刻を、別クエリで取得したJPL Horizons値と比較する。
+  // これにより、保存値だけでなく4点補間も全7天体・全期間にわたり検証する。
+  for (const JplDatabaseExpected& expected : kJplDatabaseExpected) {
+    astro::EquatorialCoord actual;
+    const bool found =
+        astro::lookupHighPrecisionEquatorial(expected.body, expected.unixSeconds, actual);
+    CHECK_TRUE(found);
+    CHECK_NEAR_ANGLE(actual.rightAscensionDegrees, expected.rightAscensionDegrees, 0.001);
+    CHECK_NEAR(actual.declinationDegrees, expected.declinationDegrees, 0.001);
+    const double distanceTolerance = std::max(1e-9, expected.distanceAu * 2e-6);
+    CHECK_NEAR(actual.distanceAu, expected.distanceAu, distanceTolerance);
+  }
+
+  astro::EquatorialCoord outside;
+  const bool foundBefore = astro::lookupHighPrecisionEquatorial(astro::EphemerisBody::Moon,
+                                                                info.startUnixSeconds - 1, outside);
+  const bool foundAfter = astro::lookupHighPrecisionEquatorial(astro::EphemerisBody::Moon,
+                                                               info.stopUnixSeconds + 1, outside);
+  CHECK_TRUE(!foundBefore);
+  CHECK_TRUE(!foundAfter);
 }
 
 void testKeplerSolver() {
@@ -352,6 +418,7 @@ void testEphemerisFacade() {
   const astro::TargetPosition north =
       astro::computeTargetPosition(astro::Target::North, 0, tokyo, false);
   CHECK_TRUE(north.valid);
+  CHECK_TRUE(north.source == astro::EphemerisSource::FixedDirection);
   CHECK_NEAR(north.horizontal.azimuthDegrees, 0.0, 1e-12);
   CHECK_NEAR(north.horizontal.altitudeDegrees, 0.0, 1e-12);
 
@@ -362,10 +429,11 @@ void testEphemerisFacade() {
 
   // 2026-08-11 12:00 JST = 03:00 UTC。東京の夏の南中前後なので、
   // 太陽は高くて南寄りにいるはず。
-  const std::int64_t noonJst = 1786064400;
+  const std::int64_t noonJst = 1786417200;
   const astro::TargetPosition sun =
       astro::computeTargetPosition(astro::Target::Sun, noonJst, tokyo, true);
   CHECK_TRUE(sun.valid);
+  CHECK_TRUE(sun.source == astro::EphemerisSource::HighPrecisionDatabase);
   CHECK_TRUE(sun.aboveHorizon);
   CHECK_TRUE(sun.horizontal.altitudeDegrees > 50.0);
   CHECK_TRUE(sun.horizontal.azimuthDegrees > 90.0 && sun.horizontal.azimuthDegrees < 270.0);
@@ -376,6 +444,12 @@ void testEphemerisFacade() {
   CHECK_TRUE(midnightSun.valid);
   CHECK_TRUE(!midnightSun.aboveHorizon);
   CHECK_TRUE(midnightSun.horizontal.altitudeDegrees < 0.0);
+
+  // DB期間外も従来の近似計算へ戻り、天体を指せなくならない。
+  const astro::TargetPosition historicalSun =
+      astro::computeTargetPosition(astro::Target::Sun, 946684800, tokyo, true);
+  CHECK_TRUE(historicalSun.valid);
+  CHECK_TRUE(historicalSun.source == astro::EphemerisSource::ApproximateModel);
 
   // 全ターゲットが解けて、方位が [0,360) に収まる
   for (std::uint8_t index = 0; index < static_cast<std::uint8_t>(astro::Target::kCount); ++index) {
@@ -406,6 +480,7 @@ int main() {
   testMoonAccuracy();
   testMoonParallaxMatters();
   testPlanetAccuracy();
+  testEphemerisDatabase();
   testKeplerSolver();
   testEphemerisFacade();
   return testing::summarize("astro");

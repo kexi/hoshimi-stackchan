@@ -25,7 +25,7 @@
 namespace {
 
 struct Options {
-  std::int64_t unixSeconds = 1786064400; // 2026-08-11 12:00 JST
+  std::int64_t unixSeconds = 1786417200; // 2026-08-11 12:00 JST
   double latitude = 35.681236;
   double longitudeEast = 139.767125;
   float declinationEast = -7.9F;

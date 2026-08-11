@@ -1,0 +1,17 @@
+title = "compass-stackchan secret scanning"
+
+[extend]
+useDefault = true
+
+# 生成し直せる依存・ビルド成果物は検査対象外。ここを除かないと、作業ツリー検査が
+# PlatformIOの数GBのキャッシュまで走査し、リポジトリ自身の確認が埋もれる。
+[allowlist]
+description = "generated dependencies and build outputs"
+paths = [
+  '''(^|/)\.direnv/''',
+  '''(^|/)\.platformio/''',
+  '''(^|/)\.stackchan/''',
+  '''(^|/)build/''',
+  '''(^|/)firmware/\.pio/''',
+  '''(^|/)__pycache__/''',
+]

@@ -366,7 +366,7 @@ void testMeasurementPoseGate() {
   CHECK_TRUE(gate.evaluate(turnedAndMoving) ==
              compass::MeasurementGate::Reject::NotMeasurementPose);
 
-  // 許容範囲の境界: ±2 度なら通り、それを超えたら弾く
+  // 許容範囲の境界: ±10度なら通り、それを超えたら弾く。
   CHECK_TRUE(compass::isMeasurementPose(0));
   CHECK_TRUE(compass::isMeasurementPose(compass::kMeasurementYawToleranceDeci));
   CHECK_TRUE(compass::isMeasurementPose(-compass::kMeasurementYawToleranceDeci));
@@ -379,26 +379,34 @@ void testServoBiasTable() {
   CHECK_TRUE(!table.isPopulated());
   // 未学習なら補正しない
   CHECK_NEAR(table.correctionDegrees(0), 0.0, 1e-6);
+  CHECK_TRUE(!table.hasObservationFor(0));
 
-  table.observe(0, 2.0F);
+  CHECK_TRUE(table.observe(0, 2.0F));
   CHECK_NEAR(table.correctionDegrees(0), 2.0, 1e-5);
+  CHECK_TRUE(table.hasObservationFor(0));
+  // 近い区画の補正値を参照できても、実測済みとは扱わないこと。
+  // 借りた値をゲートへ通すと、実機では方位が約 270 度飛んだ。
+  CHECK_TRUE(!table.hasObservationFor(-400));
+  CHECK_NEAR(table.correctionDegrees(-400), 2.0, 1e-5);
   // 1 ビンでは補正として信用しない。未学習ビンは近いビンの値を借りるので、
   // 1 つの値を全角度に当てることになり、遠い角度ほど外れる。
   CHECK_TRUE(!table.isPopulated());
   CHECK_TRUE(table.populatedBinCount() == 1);
 
-  // 同じビンへの複数観測は平均される
-  table.observe(0, 4.0F);
+  // 同じビンへの複数観測は平均され、2の冪回だけ保存候補になる。
+  CHECK_TRUE(table.observe(0, 4.0F));
   CHECK_NEAR(table.correctionDegrees(0), 3.0, 1e-4);
+  CHECK_TRUE(!table.observe(0, 3.0F));
+  CHECK_TRUE(table.observe(0, 3.0F));
 
   // 別のビンは独立
-  table.observe(1200, -5.0F);
+  static_cast<void>(table.observe(1200, -5.0F));
   CHECK_NEAR(table.correctionDegrees(1200), -5.0, 1e-5);
   CHECK_NEAR(table.correctionDegrees(0), 3.0, 1e-4);
 
   // 首を全域に振ってビンが揃えば、補正として使える
   for (int yawDeci = -1200; yawDeci <= 1200; yawDeci += 160) {
-    table.observe(yawDeci, static_cast<float>(yawDeci) / 100.0F);
+    static_cast<void>(table.observe(yawDeci, static_cast<float>(yawDeci) / 100.0F));
   }
   CHECK_TRUE(table.populatedBinCount() >= compass::ServoBiasTable::kMinPopulatedBins);
   CHECK_TRUE(table.isPopulated());
@@ -411,8 +419,8 @@ void testServoBiasTable() {
 
   // 誤差は円環量として平均される (359 度と 1 度の平均が 180 度にならない)
   compass::ServoBiasTable circular;
-  circular.observe(0, 359.0F);
-  circular.observe(0, 1.0F);
+  static_cast<void>(circular.observe(0, 359.0F));
+  static_cast<void>(circular.observe(0, 1.0F));
   const float averaged = circular.correctionDegrees(0);
   CHECK_TRUE(std::fabs(averaged) < 5.0F || std::fabs(averaged - 360.0F) < 5.0F);
 

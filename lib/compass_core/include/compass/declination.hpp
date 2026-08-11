@@ -8,8 +8,8 @@ namespace compass {
 // センサの磁方位をそのまま使うと日本では 7-9 度ずれる。方位精度 0.1 度の
 // 要求に対して致命的なので、偏角の設定は必須。
 //
-// Why not IGRF 全球モデル: 13 次の係数表 (195 係数 x 2) を積むほどの価値がない。
-// ユーザーが自分の土地の値を NOAA の計算機から一度入れれば 0.01 度精度で足りる。
+// Why not IGRF 全球モデル: 13次の係数表を実機へ積むより、設置場所と利用年に
+// 対応する値を設定ファイルで更新する方が小さい。位置や年を変える場合は再設定する。
 [[nodiscard]] float trueHeadingFromMagnetic(float magneticHeadingDegrees,
                                             float declinationEastDegrees);
 

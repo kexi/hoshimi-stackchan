@@ -3,6 +3,7 @@
 #include "astro/angles.hpp"
 #include "astro/sun.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace astro {
@@ -75,6 +76,35 @@ const ElementSet& elementSetFor(Planet planet) {
 
 // 光速で 1 AU を進む時間 [日]
 constexpr double kLightTimePerAuDays = 0.005775518331;
+constexpr double kJ2000MeanObliquityDegrees = 23.439291111;
+
+// J2000 平均赤道座標を、観測日の平均赤道・分点へ歳差変換する。
+// Meeus ch.21 の IAU 1976 式。JPL 近似要素の直交座標は J2000 基準なので、
+// この変換を省くと 2026 年時点で赤経が約 0.4 度遅れる。
+EquatorialCoord precessJ2000ToDate(EquatorialCoord j2000, JulianDate julianDate) {
+  const double t = julianDate.centuriesSinceJ2000();
+  const double tSquared = t * t;
+  const double tCubed = tSquared * t;
+  const double zetaDegrees = (2306.2181 * t + 0.30188 * tSquared + 0.017998 * tCubed) / 3600.0;
+  const double zDegrees = (2306.2181 * t + 1.09468 * tSquared + 0.018203 * tCubed) / 3600.0;
+  const double thetaDegrees = (2004.3109 * t - 0.42665 * tSquared - 0.041833 * tCubed) / 3600.0;
+
+  const double alphaPlusZeta = degToRad(j2000.rightAscensionDegrees + zetaDegrees);
+  const double declination = degToRad(j2000.declinationDegrees);
+  const double theta = degToRad(thetaDegrees);
+
+  const double a = std::cos(declination) * std::sin(alphaPlusZeta);
+  const double b = std::cos(theta) * std::cos(declination) * std::cos(alphaPlusZeta) -
+                   std::sin(theta) * std::sin(declination);
+  const double c = std::sin(theta) * std::cos(declination) * std::cos(alphaPlusZeta) +
+                   std::cos(theta) * std::sin(declination);
+
+  EquatorialCoord result;
+  result.rightAscensionDegrees = normalizeDegrees(radToDeg(std::atan2(a, b)) + zDegrees);
+  result.declinationDegrees = radToDeg(std::asin(std::clamp(c, -1.0, 1.0)));
+  result.distanceAu = j2000.distanceAu;
+  return result;
+}
 
 CartesianAu heliocentricFromElements(const ElementSet& set, double t) {
   const double semiMajorAxis = set.semiMajorAxisAu + set.semiMajorAxisRate * t;
@@ -185,6 +215,12 @@ EquatorialCoord planetEquatorial(Planet planet, JulianDate julianDate) {
   ecliptic.longitudeDegrees = normalizeDegrees(radToDeg(std::atan2(dy, dx)));
   ecliptic.latitudeDegrees = radToDeg(std::atan2(dz, std::sqrt(dx * dx + dy * dy)));
   ecliptic.distanceAu = distanceAu;
+
+  // JPL の近似要素は J2000 平均黄道・分点基準。地上から見える方向へ変換する
+  // 前に観測日の平均赤道・分点へ歳差させる。
+  const EquatorialCoord meanJ2000 = equatorialFromEcliptic(ecliptic, kJ2000MeanObliquityDegrees);
+  const EquatorialCoord meanOfDate = precessJ2000ToDate(meanJ2000, julianDate);
+  ecliptic = eclipticFromEquatorial(meanOfDate, meanObliquityDegrees(julianDate));
 
   // 年周光行差 (Meeus 23.2)。地球の公転による見かけのずれで最大 20.5 秒角 = 0.0057 度。
   // 章動と同程度の大きさなので、片方だけ入れるのは中途半端になる。

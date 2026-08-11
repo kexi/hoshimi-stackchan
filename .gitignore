@@ -10,3 +10,6 @@ firmware/src/wifi_config.h
 # scripts が互いを import すると生成される
 __pycache__/
 *.pyc
+
+# just diagnose が生成する、端末固有の診断ログ
+.stackchan/diagnostics/

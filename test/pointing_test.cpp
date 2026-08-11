@@ -51,6 +51,14 @@ void testYawMapping() {
   CHECK_TRUE(pointing::yawDeciFromRelativeBearing(-350.0) == 100);
 }
 
+void testServoArrivalRequiresBothAxes() {
+  // yaw と pitch の両方が許容差内に入ったときだけ、到達済みと判定すること。
+  constexpr int kToleranceDeci = 100;
+  CHECK_TRUE(pointing::isServoAtTarget(905, 705, 900, 700, kToleranceDeci));
+  CHECK_TRUE(!pointing::isServoAtTarget(1100, 705, 900, 700, kToleranceDeci));
+  CHECK_TRUE(!pointing::isServoAtTarget(905, 900, 900, 700, kToleranceDeci));
+}
+
 void testSolveBasic() {
   // 機体が真北を向いていて、目標が真東・高度 30 度
   pointing::SolveInput input;
@@ -186,6 +194,7 @@ void testCommandsStayInRange() {
 int main() {
   testPitchMapping();
   testYawMapping();
+  testServoArrivalRequiresBothAxes();
   testSolveBasic();
   testSolveClampsHighAltitude();
   testSolveClampsWideBearing();

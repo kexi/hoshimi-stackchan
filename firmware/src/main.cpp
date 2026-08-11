@@ -3,9 +3,9 @@
 // 真北と天体 (太陽・月・水星〜土星) の方向を、首で物理的に指し示す。
 // yaw で方位を、pitch で高度を表す。
 //
-// 磁気測定は必ず首を正面に戻してから行う。首の角度によって方位が最大 119 度
-// ずれることを実機で確認しているため (段階 8)。ロジックは app_core 側にあり、
-// ここは実機の入出力を state machine に橋渡しするだけ。
+// 未学習の首角度では、磁気測定前に首を正面へ戻す。首の角度によって方位が最大
+// 119 度ずれるためで、学習済み角度だけServoBiasTableで補正する。
+// ロジックは app_core 側にあり、ここは実機の入出力をstate machineへ橋渡しする。
 //
 // 状態はシリアルへ出す (just watch / just verify で読む)。
 //
@@ -15,21 +15,29 @@
 // それ自体がウォッチドッグを踏んで数秒ごとに再起動していた。
 
 #include <Avatar.h>
+#include <ESPmDNS.h>
+#include <HTTPClient.h>
 #include <M5StackChan.h>
 #include <M5Unified.h>
+#include <NetworkClientSecure.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_mac.h>
+#include <esp_sntp.h>
+#include <esp_system.h>
 
+#include "app/presentation.hpp"
 #include "app/state.hpp"
-#include "compass/calibration.hpp"
 #include "compass/declination.hpp"
 #include "compass/heading.hpp"
 #include "compass/level_calibration.hpp"
-#include "compass/sphere_fit.hpp"
 #include "compass/stability.hpp"
+#include "connectivity/geoip.hpp"
 #include "location_config.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -45,18 +53,43 @@
 #define WIFI_PASSWORD ""
 #endif
 
+#ifndef NTP_SERVER_1
+#define NTP_SERVER_1 "ntp.nict.jp"
+#endif
+
+#ifndef NTP_SERVER_2
+#define NTP_SERVER_2 "pool.ntp.org"
+#endif
+
+#ifndef GEOIP_ENABLED
+#define GEOIP_ENABLED true
+#endif
+
+#ifndef GEOIP_URL
+#define GEOIP_URL "https://ipwho.is/?fields=success,latitude,longitude"
+#endif
+
 namespace {
 
-constexpr const char* kCalibrationNamespace = "magcal";
+constexpr const char* kBiasNamespace = "bias";
+constexpr const char* kLevelNamespace = "level";
+constexpr const char* kGeoIpNamespace = "geoip";
+// 水平方位の基準や学習規則を変えたら上げる。旧基準の補正量は混ぜない。
+constexpr std::uint32_t kBiasStorageVersion = 3;
+// v1以前は交差軸の歪みを持たず、水平投影後の回転楕円を補正できない。
+constexpr std::uint32_t kLevelStorageVersion = 2;
+constexpr std::uint32_t kGeoIpStorageVersion = 1;
 constexpr int kMoveSpeed = 400;
-constexpr std::uint32_t kWifiTimeoutMillis = 20000;
+constexpr std::uint32_t kGeoIpRefreshSeconds = 24 * 60 * 60;
+constexpr std::uint32_t kNetworkRetryMillis = 5 * 60 * 1000;
+constexpr std::uint16_t kGeoIpHttpTimeoutMillis = 5000;
 
-// キャリブレーションのサンプルを全点保持して球に当てはめる。
+// 水平投影したキャリブレーションのサンプルを全点保持して円に当てはめる。
 //
 // Why not min/max: 各軸の端に到達した 2 点しか使わないので、端まで回しきらないと
 // 中心が「回した範囲の中心」に寄る。実機ではそれで補正後の水平成分が地磁気の
-// 6 割になり、方位が全方位に散らばった。最小二乗なら球面の一部さえ掃ければ
-// 中心が求まるので、短い回転で済む。
+// 6 割になり、方位が全方位に散らばった。最小二乗と被覆率を組み合わせ、
+// 一周した水平円だけを採用する。
 constexpr std::size_t kCalibrationCapacity = 512;
 constexpr std::size_t kMinCalibrationSamples = 24;
 constexpr float kMinFieldRadiusMicroTesla = 12.0F;
@@ -69,22 +102,89 @@ constexpr std::uint32_t kFitIntervalMillis = 700;
 // NVS への書き込みはこれより間引く (フラッシュの摩耗を避けるため)。
 constexpr std::uint32_t kProbeIntervalMillis = 500;
 constexpr std::uint32_t kNvsProbeIntervalMillis = 30000;
+constexpr std::uint32_t kBiasSaveIntervalMillis = 30000;
+// 正面で採った方位を、バイアス学習の基準として使える時間。
+//
+// 古い基準を使うと、その間に機体が動いていた分だけ誤って覚える。実機では
+// 掃引の後半ほど基準からずれ、学習後の方位が測るたびに 270 度飛んだ。
+constexpr std::uint32_t kBiasBasisValidMillis = 4000;
+constexpr int kServoArrivalToleranceDeci = compass::kMeasurementYawToleranceDeci;
+
+// CoreS3ではBMM150がBMI270のAUX I2C配下にある。M5Unified 0.2.19は
+// BMM150の反復回数を既定値1のままにするため、Bosch推奨の高精度設定を適用する。
+constexpr std::uint8_t kBmi270Address = 0x69;
+constexpr std::uint8_t kBmi270AuxDataRegister = 0x04;
+constexpr std::uint8_t kBmi270StatusRegister = 0x03;
+constexpr std::uint8_t kBmi270AuxInterfaceConfigRegister = 0x4C;
+constexpr std::uint8_t kBmi270AuxReadAddressRegister = 0x4D;
+constexpr std::uint8_t kBmi270AuxWriteAddressRegister = 0x4E;
+constexpr std::uint8_t kBmi270AuxWriteDataRegister = 0x4F;
+constexpr std::uint8_t kBmi270AuxBusyMask = 0x04;
+constexpr std::uint8_t kBmi270AuxManualReadConfig = 0x80;
+constexpr std::uint8_t kBmi270AuxAutomaticReadConfig = 0x4F;
+constexpr std::uint8_t kBmm150DataStartRegister = 0x42;
+constexpr std::uint8_t kBmm150OperationModeRegister = 0x4C;
+constexpr std::uint8_t kBmm150XyRepetitionsRegister = 0x51;
+constexpr std::uint8_t kBmm150ZRepetitionsRegister = 0x52;
+constexpr std::uint8_t kBmm150SleepMode30Hz = 0x3E;
+constexpr std::uint8_t kBmm150HighAccuracyXyRepetitions = 23;
+constexpr std::uint8_t kBmm150HighAccuracyZRepetitions = 82;
+constexpr std::uint8_t kBmm150NormalMode20Hz = 0x28;
+constexpr std::uint32_t kInternalI2cFrequency = 400000;
+
+struct ServoAngles {
+  int yawDeci = 0;
+  int pitchDeci = pointing::kPitchLevelDeci;
+};
+
+struct StoredGeoIpLocation {
+  double latitudeDegrees = 0.0;
+  double longitudeEastDegrees = 0.0;
+  std::int64_t updatedUnixSeconds = 0;
+};
+
+enum class LocationSource : std::uint8_t {
+  Fixed,
+  CachedGeoIp,
+  LiveGeoIp,
+};
+
+class BuiltInCertificateBundleClient : public NetworkClientSecure {
+public:
+  void useBuiltInCertificateBundle() {
+    // Why not setInsecure(): GeoIPを改ざんされると、正しい天体でも別方向を指す。
+    // ESP-IDF同梱の公開CA束を使い、特定サービスの中間証明書更新にも追従する。
+    attach_ssl_certificate_bundle(sslclient.get(), true);
+    _use_ca_bundle = true;
+    _use_insecure = false;
+  }
+};
 
 app::State g_state;
 app::Config g_config;
 astro::Observer g_observer;
+std::array<char, 17> g_hostName{};
+LocationSource g_locationSource = LocationSource::Fixed;
+bool g_wifiConnected = false;
+bool g_mdnsStarted = false;
+bool g_mdnsAttempted = false;
+bool g_ntpConfigured = false;
+bool g_ntpSynchronized = false;
+bool g_geoIpAttempted = false;
+std::uint32_t g_lastMdnsAttemptMillis = 0;
+std::uint32_t g_lastGeoIpAttemptMillis = 0;
+std::atomic<bool> g_ntpSyncPending{false};
+StoredGeoIpLocation g_storedGeoIp;
+bool g_hasStoredGeoIp = false;
 
-compass::MagCalibration g_calibration;
-// 3x3 のソフトアイアン補正。実機の歪みは対角では直せず、方位が 32 度ずれた。
-compass::EllipsoidFit g_ellipsoid;
 // 水平回転で取る補正。この機体は本体に強い磁石があり、傾けると磁石も一緒に
 // 動くので 8 の字回しでは地磁気の球にならない (実機で半径 169uT = 地磁気の
 // 3.7 倍になった)。首を固定して本体だけ水平に回せば相対関係が保たれる。
 compass::LevelCalibration g_level;
 // 直近の当てはめの被覆率。描画から読むだけにして、当てはめは間隔を空けて回す。
 float g_calibrationCoverage = 0.0F;
-// キャリブレーション開始時の姿勢。ここから外れたサンプルは採らない。
-float g_referenceTilt = 0.0F;
+// キャリブレーション開始時の重力方向。ここから外れたサンプルは採らない。
+compass::Vec3 g_referenceGravity;
 // タッチ入力を受けた回数。実機でスワイプが検出されているかを見る。
 int g_touchEventCount = 0;
 // 3 ゾーンの強度を 1 つの整数に畳んだもの (前*100 + 中*10 + 後)。
@@ -107,6 +207,7 @@ compass::HeadingFilter g_headingFilter{0.15F};
 compass::ServoBiasTable g_biasTable;
 // 正面で採った方位。バイアス表を学習するときの真値として使う。
 float g_measurePoseHeading = 0.0F;
+std::uint32_t g_measurePoseHeadingMillis = 0;
 bool g_hasMeasurePoseHeading = false;
 // 表を書き換えたが、まだ NVS に落としていない。
 bool g_biasDirty = false;
@@ -117,9 +218,16 @@ std::size_t g_calibrationCount = 0;
 bool g_timeValid = false;
 bool g_headingValid = false;
 float g_bodyTrueHeading = 0.0F;
+esp_reset_reason_t g_bootResetReason = ESP_RST_UNKNOWN;
+bool g_magnetometerHighAccuracy = false;
+std::uint8_t g_bmm150XyRepetitions = 0;
+std::uint8_t g_bmm150ZRepetitions = 0;
+std::uint8_t g_bmm150OperationMode = 0;
+compass::Vec3 g_lastRawMag;
+compass::Vec3 g_lastAccel;
 
-std::uint32_t g_lastServoCommandMillis = 0;
 std::uint32_t g_lastServoStopMillis = 0;
+std::uint32_t g_lastObservedServoMotionMillis = 0;
 int g_commandedYaw = 0;
 int g_commandedPitch = pointing::kPitchLevelDeci;
 
@@ -139,6 +247,131 @@ compass::Vec3 readAccel() {
   return compass::Vec3{x, y, z};
 }
 
+bool waitForBmi270AuxIdle() {
+  constexpr int kMaximumPolls = 20;
+  for (int poll = 0; poll < kMaximumPolls; ++poll) {
+    const std::uint8_t status =
+        M5.In_I2C.readRegister8(kBmi270Address, kBmi270StatusRegister, kInternalI2cFrequency);
+    const bool auxiliaryWriteFinished = (status & kBmi270AuxBusyMask) == 0;
+    if (auxiliaryWriteFinished) {
+      return true;
+    }
+    delay(1);
+  }
+  return false;
+}
+
+bool restoreBmm150AutomaticRead() {
+  const bool configRestored =
+      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxInterfaceConfigRegister,
+                               kBmi270AuxAutomaticReadConfig, kInternalI2cFrequency);
+  const bool addressRestored =
+      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxReadAddressRegister,
+                               kBmm150DataStartRegister, kInternalI2cFrequency);
+  return configRestored && addressRestored;
+}
+
+bool writeBmm150AuxRegister(std::uint8_t registerAddress, std::uint8_t value) {
+  // Why not自動読出し中のまま書く: BMI270は動作モードの書込みだけ通る場合があるが、
+  // 実機ではREPXY/REPZが0のまま残った。M5Unifiedの初期化と同じ手動モードで書く。
+  const bool manualModeEntered =
+      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxInterfaceConfigRegister,
+                               kBmi270AuxManualReadConfig, kInternalI2cFrequency);
+  const bool manualModeFailed = !manualModeEntered;
+  if (manualModeFailed) {
+    restoreBmm150AutomaticRead();
+    return false;
+  }
+
+  const bool dataWritten = M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxWriteDataRegister,
+                                                    value, kInternalI2cFrequency);
+  const bool dataWriteFailed = !dataWritten;
+  if (dataWriteFailed) {
+    restoreBmm150AutomaticRead();
+    return false;
+  }
+
+  const bool addressWritten = M5.In_I2C.writeRegister8(
+      kBmi270Address, kBmi270AuxWriteAddressRegister, registerAddress, kInternalI2cFrequency);
+  const bool addressWriteFailed = !addressWritten;
+  if (addressWriteFailed) {
+    restoreBmm150AutomaticRead();
+    return false;
+  }
+
+  const bool writeFinished = waitForBmi270AuxIdle();
+  const bool automaticReadRestored = restoreBmm150AutomaticRead();
+  return writeFinished && automaticReadRestored;
+}
+
+bool readBmm150AuxRegister(std::uint8_t registerAddress, std::uint8_t& value) {
+  const bool manualModeEntered =
+      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxInterfaceConfigRegister,
+                               kBmi270AuxManualReadConfig, kInternalI2cFrequency);
+  const bool readAddressWritten = M5.In_I2C.writeRegister8(
+      kBmi270Address, kBmi270AuxReadAddressRegister, registerAddress, kInternalI2cFrequency);
+  const bool requestStarted = manualModeEntered && readAddressWritten;
+  const bool requestFinished = requestStarted && waitForBmi270AuxIdle();
+  if (requestFinished) {
+    value = M5.In_I2C.readRegister8(kBmi270Address, kBmi270AuxDataRegister, kInternalI2cFrequency);
+  }
+
+  // Why not読出し先をそのままにする: M5Unifiedは0x42から8バイトの自動読出しを
+  // 前提に磁気を取り込むので、診断後に戻さないと全測定が壊れる。
+  const bool automaticReadRestored = restoreBmm150AutomaticRead();
+  return requestFinished && automaticReadRestored;
+}
+
+bool configureMagnetometerForAccuracy() {
+  // Why notホスト側の移動平均だけに頼る: BMM150自身の反復測定なら、サンプルを
+  // 出す前にセンサー内部でノイズを平均でき、後段へ大振幅のZノイズを渡さない。
+  const bool enteredSleep =
+      writeBmm150AuxRegister(kBmm150OperationModeRegister, kBmm150SleepMode30Hz);
+  const bool sleepTransitionFailed = !enteredSleep;
+  if (sleepTransitionFailed) {
+    return false;
+  }
+  delay(1);
+
+  const bool xyConfigured =
+      writeBmm150AuxRegister(kBmm150XyRepetitionsRegister, kBmm150HighAccuracyXyRepetitions);
+  const bool xyConfigurationFailed = !xyConfigured;
+  if (xyConfigurationFailed) {
+    return false;
+  }
+
+  const bool zConfigured =
+      writeBmm150AuxRegister(kBmm150ZRepetitionsRegister, kBmm150HighAccuracyZRepetitions);
+  const bool zConfigurationFailed = !zConfigured;
+  if (zConfigurationFailed) {
+    return false;
+  }
+
+  const bool normalModeEntered =
+      writeBmm150AuxRegister(kBmm150OperationModeRegister, kBmm150NormalMode20Hz);
+  const bool normalModeTransitionFailed = !normalModeEntered;
+  if (normalModeTransitionFailed) {
+    return false;
+  }
+
+  // 高精度プリセットの1測定は約49msなので、最初の値を読む前に完了を待つ。
+  delay(50);
+
+  const bool xyRead = readBmm150AuxRegister(kBmm150XyRepetitionsRegister, g_bmm150XyRepetitions);
+  const bool zRead = readBmm150AuxRegister(kBmm150ZRepetitionsRegister, g_bmm150ZRepetitions);
+  const bool modeRead = readBmm150AuxRegister(kBmm150OperationModeRegister, g_bmm150OperationMode);
+  const bool xyMatches = g_bmm150XyRepetitions == kBmm150HighAccuracyXyRepetitions;
+  const bool zMatches = g_bmm150ZRepetitions == kBmm150HighAccuracyZRepetitions;
+  const bool modeMatches = (g_bmm150OperationMode & 0x3E) == kBmm150NormalMode20Hz;
+  return xyRead && zRead && modeRead && xyMatches && zMatches && modeMatches;
+}
+
+compass::Vec3 correctedHorizontalField(compass::Vec3 magneticField, compass::Vec3 acceleration) {
+  const compass::Attitude attitude = compass::attitudeFromAccel(acceleration);
+  const compass::Vec3 horizontal = compass::horizontalMagneticComponents(magneticField, attitude);
+  return compass::applyLevelCalibration(g_level, horizontal);
+}
+
 float readGyroMagnitude() {
   float x = 0.0F;
   float y = 0.0F;
@@ -147,132 +380,443 @@ float readGyroMagnitude() {
   return std::sqrt(x * x + y * y + z * z);
 }
 
-void loadCalibration() {
-  Preferences preferences;
-  if (!preferences.begin(kCalibrationNamespace, true)) {
-    return;
+bool setClockFromUnix(std::time_t unixSeconds) {
+  const auto unix64 = static_cast<std::int64_t>(unixSeconds);
+  const bool isPlausible = unix64 >= 1700000000LL && unix64 < 4102444800LL;
+  if (!isPlausible) {
+    return false;
   }
-  g_calibration.hardIronOffset.x = preferences.getInt("offX", 0) / 100.0F;
-  g_calibration.hardIronOffset.y = preferences.getInt("offY", 0) / 100.0F;
-  g_calibration.hardIronOffset.z = preferences.getInt("offZ", 0) / 100.0F;
-  g_calibration.softIronScale.x = preferences.getInt("sclX", 1000) / 1000.0F;
-  g_calibration.softIronScale.y = preferences.getInt("sclY", 1000) / 1000.0F;
-  g_calibration.softIronScale.z = preferences.getInt("sclZ", 1000) / 1000.0F;
-  g_calibration.valid = preferences.getInt("valid", 0) != 0;
-  preferences.end();
+
+  const std::tm* utc = std::gmtime(&unixSeconds);
+  if (utc == nullptr) {
+    return false;
+  }
+
+  // OS時計とRTCを同じUTC秒から更新し、今の計算と次回起動の両方へ反映する。
+  timeval systemClock = {unixSeconds, 0};
+  settimeofday(&systemClock, nullptr);
+
+  m5::rtc_datetime_t rtc;
+  rtc.date.year = static_cast<std::uint16_t>(utc->tm_year + 1900);
+  rtc.date.month = static_cast<std::uint8_t>(utc->tm_mon + 1);
+  rtc.date.date = static_cast<std::uint8_t>(utc->tm_mday);
+  rtc.time.hours = static_cast<std::uint8_t>(utc->tm_hour);
+  rtc.time.minutes = static_cast<std::uint8_t>(utc->tm_min);
+  rtc.time.seconds = static_cast<std::uint8_t>(utc->tm_sec);
+  M5.Rtc.setDateTime(rtc);
+  g_timeValid = true;
+  return true;
 }
 
-void saveCalibration(const compass::MagCalibration& calibration) {
-  Preferences preferences;
-  if (!preferences.begin(kCalibrationNamespace, false)) {
-    return;
+bool isLevelCalibrationAcceptable(const compass::LevelCalibration& calibration) {
+  const bool valuesAreFinite =
+      std::isfinite(calibration.offsetX) && std::isfinite(calibration.offsetY) &&
+      std::isfinite(calibration.scaleX) && std::isfinite(calibration.scaleY) &&
+      std::isfinite(calibration.crossAxis) && std::isfinite(calibration.radius) &&
+      std::isfinite(calibration.normalizedResidual);
+  if (!calibration.valid || !valuesAreFinite) {
+    return false;
   }
-  preferences.putInt("offX", static_cast<int>(std::lround(calibration.hardIronOffset.x * 100.0F)));
-  preferences.putInt("offY", static_cast<int>(std::lround(calibration.hardIronOffset.y * 100.0F)));
-  preferences.putInt("offZ", static_cast<int>(std::lround(calibration.hardIronOffset.z * 100.0F)));
-  preferences.putInt("sclX", static_cast<int>(std::lround(calibration.softIronScale.x * 1000.0F)));
-  preferences.putInt("sclY", static_cast<int>(std::lround(calibration.softIronScale.y * 1000.0F)));
-  preferences.putInt("sclZ", static_cast<int>(std::lround(calibration.softIronScale.z * 1000.0F)));
-  preferences.putInt("valid", calibration.valid ? 1 : 0);
-  preferences.end();
+
+  const float transformDeterminant =
+      calibration.scaleX * calibration.scaleY - calibration.crossAxis * calibration.crossAxis;
+  const bool transformIsPositive =
+      calibration.scaleX >= 0.1F && calibration.scaleY >= 0.1F && transformDeterminant >= 0.01F;
+  const bool transformIsBounded = calibration.scaleX <= 10.0F && calibration.scaleY <= 10.0F &&
+                                  std::fabs(calibration.crossAxis) <= 10.0F;
+  const bool radiusIsValid = calibration.radius >= kMinFieldRadiusMicroTesla;
+  const bool residualIsValid = calibration.normalizedResidual >= 0.0F &&
+                               calibration.normalizedResidual < kMaxCalibrationResidual;
+  return transformIsPositive && transformIsBounded && radiusIsValid && residualIsValid;
 }
 
-// 3x3 補正を NVS に入れる。行列は 9 要素あるので blob で扱う。
-void saveEllipsoid(const compass::EllipsoidFit& fit) {
-  Preferences preferences;
-  if (!preferences.begin("ellip", false)) {
-    return;
+bool saveLevel(const compass::LevelCalibration& calibration) {
+  const bool calibrationIsAcceptable = isLevelCalibrationAcceptable(calibration);
+  if (!calibrationIsAcceptable) {
+    return false;
   }
-  preferences.putBytes("fit", &fit, sizeof(fit));
-  preferences.end();
-}
-
-void saveLevel(const compass::LevelCalibration& calibration) {
   Preferences preferences;
-  if (!preferences.begin("level", false)) {
-    return;
+  if (!preferences.begin(kLevelNamespace, false)) {
+    return false;
   }
-  preferences.putBytes("cal", &calibration, sizeof(calibration));
+  const std::size_t written = preferences.putBytes("cal", &calibration, sizeof(calibration));
+  // 本体を書き切った後に版を確定し、中途半端な更新を現行値として読まない。
+  const std::size_t versionWritten =
+      written == sizeof(calibration) ? preferences.putUInt("version", kLevelStorageVersion) : 0;
   preferences.end();
+  return written == sizeof(calibration) && versionWritten == sizeof(kLevelStorageVersion);
 }
 
 // 首の角度によるずれの表。学習に時間がかかるので、電源を切っても残す。
-void saveBiasTable() {
+bool saveBiasTable() {
   Preferences preferences;
-  if (!preferences.begin("bias", false)) {
-    return;
+  const bool opened = preferences.begin(kBiasNamespace, false);
+  if (!opened) {
+    return false;
   }
-  preferences.putBytes("table", &g_biasTable, sizeof(g_biasTable));
+  const std::size_t written = preferences.putBytes("table", &g_biasTable, sizeof(g_biasTable));
+  // 版は本体を書き切った後に確定させる。先に版だけ更新すると、書き込み失敗時に
+  // 同じ大きさの古い表を現行データとして読む可能性がある。
+  const std::size_t versionWritten =
+      written == sizeof(g_biasTable) ? preferences.putUInt("version", kBiasStorageVersion) : 0;
   preferences.end();
+  return written == sizeof(g_biasTable) && versionWritten == sizeof(kBiasStorageVersion);
 }
 
 void loadBiasTable() {
   Preferences preferences;
-  if (!preferences.begin("bias", true)) {
+  const bool opened = preferences.begin(kBiasNamespace, true);
+  if (!opened) {
     return;
   }
+  const bool hasCurrentVersion = preferences.getUInt("version", 0) == kBiasStorageVersion;
   compass::ServoBiasTable stored;
-  if (preferences.getBytesLength("table") == sizeof(stored)) {
-    preferences.getBytes("table", &stored, sizeof(stored));
-    g_biasTable = stored;
+  const bool hasStoredTable = preferences.getBytesLength("table") == sizeof(stored);
+  const bool canLoadStoredTable = hasCurrentVersion && hasStoredTable;
+  if (canLoadStoredTable) {
+    const std::size_t read = preferences.getBytes("table", &stored, sizeof(stored));
+    const bool readComplete = read == sizeof(stored);
+    if (readComplete) {
+      g_biasTable = stored;
+    }
   }
   preferences.end();
 }
 
 void loadLevel() {
   Preferences preferences;
-  if (!preferences.begin("level", true)) {
+  if (!preferences.begin(kLevelNamespace, true)) {
     return;
   }
+  const bool hasCurrentVersion = preferences.getUInt("version", 0) == kLevelStorageVersion;
   compass::LevelCalibration stored;
-  if (preferences.getBytesLength("cal") == sizeof(stored)) {
-    preferences.getBytes("cal", &stored, sizeof(stored));
-    g_level = stored;
+  const bool hasStoredCalibration = preferences.getBytesLength("cal") == sizeof(stored);
+  const bool canLoadCalibration = hasCurrentVersion && hasStoredCalibration;
+  if (canLoadCalibration) {
+    const std::size_t read = preferences.getBytes("cal", &stored, sizeof(stored));
+    const bool readComplete = read == sizeof(stored);
+    const bool storedCalibrationIsAcceptable = readComplete && isLevelCalibrationAcceptable(stored);
+    if (storedCalibrationIsAcceptable) {
+      g_level = stored;
+    }
   }
   preferences.end();
 }
 
-void loadEllipsoid() {
-  Preferences preferences;
-  if (!preferences.begin("ellip", true)) {
+const char* locationSourceName(LocationSource source) {
+  switch (source) {
+  case LocationSource::Fixed:
+    return "fixed";
+  case LocationSource::CachedGeoIp:
+    return "cache";
+  case LocationSource::LiveGeoIp:
+    return "geoip";
+  }
+  return "unknown";
+}
+
+void initializeHostName() {
+  std::array<std::uint8_t, 6> macAddress{};
+  const esp_err_t macRead = esp_read_mac(macAddress.data(), ESP_MAC_WIFI_STA);
+  const bool macReadSucceeded = macRead == ESP_OK;
+  if (!macReadSucceeded) {
+    // 読出し失敗時も有効なRFC 6762ラベルを保つ。通常はこの経路へ来ない。
+    macAddress.fill(0);
+  }
+  g_hostName = connectivity::stackchanHostName(macAddress);
+}
+
+void loadClockFromRtc() {
+  const bool clockAlreadyValid = g_timeValid;
+  if (clockAlreadyValid) {
     return;
   }
-  compass::EllipsoidFit stored;
-  if (preferences.getBytesLength("fit") == sizeof(stored)) {
-    preferences.getBytes("fit", &stored, sizeof(stored));
-    g_ellipsoid = stored;
+
+  const auto rtcDate = M5.Rtc.getDateTime();
+  const bool rtcYearIsPlausible = rtcDate.date.year >= 2024;
+  if (!rtcYearIsPlausible) {
+    return;
   }
-  preferences.end();
+
+  std::tm timeInfo = {};
+  timeInfo.tm_year = rtcDate.date.year - 1900;
+  timeInfo.tm_mon = rtcDate.date.month - 1;
+  timeInfo.tm_mday = rtcDate.date.date;
+  timeInfo.tm_hour = rtcDate.time.hours;
+  timeInfo.tm_min = rtcDate.time.minutes;
+  timeInfo.tm_sec = rtcDate.time.seconds;
+  // RTC は UTC で持つ。timegm がないので mktime のエポック差で補正する。
+  const std::time_t asLocal = std::mktime(&timeInfo);
+  std::tm probe = {};
+  probe.tm_year = 70;
+  probe.tm_mon = 0;
+  probe.tm_mday = 1;
+  const std::time_t epochOffset = std::mktime(&probe);
+  const std::time_t utc = asLocal - epochOffset;
+  const bool rtcTimeIsPlausible = utc > 1700000000;
+  if (!rtcTimeIsPlausible) {
+    return;
+  }
+
+  timeval now = {utc, 0};
+  settimeofday(&now, nullptr);
+  g_timeValid = true;
 }
 
-// 時刻を用意する。優先順位は RTC → Wi-Fi + NTP。
+bool loadStoredGeoIp() {
+  const bool geoIpDisabled = !GEOIP_ENABLED;
+  if (geoIpDisabled) {
+    return false;
+  }
+
+  Preferences preferences;
+  const bool opened = preferences.begin(kGeoIpNamespace, true);
+  if (!opened) {
+    return false;
+  }
+  const bool hasCurrentVersion = preferences.getUInt("version", 0) == kGeoIpStorageVersion;
+  const bool hasStoredLocation = preferences.getBytesLength("location") == sizeof(g_storedGeoIp);
+  const bool canRead = hasCurrentVersion && hasStoredLocation;
+  std::size_t bytesRead = 0;
+  if (canRead) {
+    bytesRead = preferences.getBytes("location", &g_storedGeoIp, sizeof(g_storedGeoIp));
+  }
+  preferences.end();
+
+  const bool readComplete = bytesRead == sizeof(g_storedGeoIp);
+  const bool coordinatesAreValid = connectivity::isValidLocation(
+      g_storedGeoIp.latitudeDegrees, g_storedGeoIp.longitudeEastDegrees);
+  g_hasStoredGeoIp = readComplete && coordinatesAreValid;
+  if (!g_hasStoredGeoIp) {
+    return false;
+  }
+
+  g_observer.latitudeDegrees = g_storedGeoIp.latitudeDegrees;
+  g_observer.longitudeEastDegrees = g_storedGeoIp.longitudeEastDegrees;
+  g_locationSource = LocationSource::CachedGeoIp;
+  return true;
+}
+
+bool saveStoredGeoIp(const connectivity::GeoIpLocation& location, std::int64_t updatedUnixSeconds) {
+  const bool locationIsValid =
+      location.valid &&
+      connectivity::isValidLocation(location.latitudeDegrees, location.longitudeEastDegrees);
+  if (!locationIsValid) {
+    return false;
+  }
+
+  StoredGeoIpLocation stored;
+  stored.latitudeDegrees = location.latitudeDegrees;
+  stored.longitudeEastDegrees = location.longitudeEastDegrees;
+  stored.updatedUnixSeconds = updatedUnixSeconds;
+
+  Preferences preferences;
+  const bool opened = preferences.begin(kGeoIpNamespace, false);
+  if (!opened) {
+    return false;
+  }
+  const std::size_t written = preferences.putBytes("location", &stored, sizeof(stored));
+  const std::size_t versionWritten =
+      written == sizeof(stored) ? preferences.putUInt("version", kGeoIpStorageVersion) : 0;
+  preferences.end();
+  const bool writeComplete =
+      written == sizeof(stored) && versionWritten == sizeof(kGeoIpStorageVersion);
+  if (!writeComplete) {
+    return false;
+  }
+
+  g_storedGeoIp = stored;
+  g_hasStoredGeoIp = true;
+  return true;
+}
+
+bool storedGeoIpIsFresh(std::int64_t nowUnixSeconds) {
+  const bool timestampIsOrdered =
+      g_hasStoredGeoIp && nowUnixSeconds >= g_storedGeoIp.updatedUnixSeconds;
+  if (!timestampIsOrdered) {
+    return false;
+  }
+  return nowUnixSeconds - g_storedGeoIp.updatedUnixSeconds < kGeoIpRefreshSeconds;
+}
+
+void onNtpTimeSynchronized(struct timeval*) { g_ntpSyncPending.store(true); }
+
+bool applyPendingNtpTime() {
+  const bool syncWasPending = g_ntpSyncPending.exchange(false);
+  if (!syncWasPending) {
+    return false;
+  }
+
+  const std::time_t now = std::time(nullptr);
+  const bool timeIsPlausible = now > 1700000000;
+  if (!timeIsPlausible) {
+    return false;
+  }
+
+  // SNTPはシステム時計を先に更新する。RTCへも同じ秒を残してオフライン起動へ渡す。
+  const bool clockPersisted = setClockFromUnix(now);
+  g_ntpSynchronized = clockPersisted;
+  return clockPersisted;
+}
+
+void startWifi() {
+  initializeHostName();
+  const bool wifiIsConfigured = std::strlen(WIFI_SSID) > 0;
+  if (!wifiIsConfigured) {
+    return;
+  }
+
+  // EspressifのAPI要件どおり、STAを開始する前にDHCP/mDNSホスト名を設定する。
+  WiFi.setHostname(g_hostName.data());
+  WiFi.setAutoReconnect(true);
+  // Why not setup内で接続完了を待つ: 圏外時に顔と方位制御の起動が数十秒止まる。
+  // begin後はloopから接続、mDNS、NTP、GeoIPを段階的に成立させる。
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  g_wifiConnected = WiFi.status() == WL_CONNECTED;
+}
+
+bool configureNtpSynchronization() {
+  const bool wifiIsConnected = WiFi.status() == WL_CONNECTED;
+  if (!wifiIsConnected) {
+    return false;
+  }
+
+  g_ntpSyncPending.store(false);
+  sntp_set_time_sync_notification_cb(onNtpTimeSynchronized);
+  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+  g_ntpConfigured = true;
+  return true;
+}
+
+connectivity::GeoIpLocation fetchGeoIpLocation() {
+  connectivity::GeoIpLocation result;
+  const bool canUseTls = g_timeValid && WiFi.status() == WL_CONNECTED;
+  if (!canUseTls) {
+    return result;
+  }
+
+  BuiltInCertificateBundleClient client;
+  client.useBuiltInCertificateBundle();
+  client.setHandshakeTimeout(5);
+  HTTPClient request;
+  request.setConnectTimeout(kGeoIpHttpTimeoutMillis);
+  request.setTimeout(kGeoIpHttpTimeoutMillis);
+  request.setUserAgent("compass-stackchan/1");
+  const bool requestStarted = request.begin(client, GEOIP_URL);
+  if (!requestStarted) {
+    return result;
+  }
+
+  const int status = request.GET();
+  const bool responseSucceeded = status == HTTP_CODE_OK;
+  if (!responseSucceeded) {
+    request.end();
+    return result;
+  }
+
+  const String payload = request.getString();
+  request.end();
+  constexpr std::size_t kMaximumGeoIpResponseBytes = 512;
+  const bool responseSizeIsSafe = payload.length() <= kMaximumGeoIpResponseBytes;
+  if (!responseSizeIsSafe) {
+    return result;
+  }
+  return connectivity::parseGeoIpResponse(std::string_view(payload.c_str(), payload.length()));
+}
+
+bool refreshGeoIpLocation() {
+  const bool geoIpEnabled = GEOIP_ENABLED;
+  const bool networkIsReady = g_wifiConnected && g_timeValid;
+  if (!geoIpEnabled || !networkIsReady) {
+    return false;
+  }
+
+  g_geoIpAttempted = true;
+  g_lastGeoIpAttemptMillis = millis();
+  const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+  const bool cachedLocationIsFresh = storedGeoIpIsFresh(now);
+  if (cachedLocationIsFresh) {
+    return true;
+  }
+
+  const connectivity::GeoIpLocation location = fetchGeoIpLocation();
+  if (!location.valid) {
+    return false;
+  }
+
+  g_observer.latitudeDegrees = location.latitudeDegrees;
+  g_observer.longitudeEastDegrees = location.longitudeEastDegrees;
+  g_locationSource = LocationSource::LiveGeoIp;
+  const bool locationSaved = saveStoredGeoIp(location, now);
+  if (!locationSaved) {
+    Serial.println("geoip-save=failed");
+  }
+  return true;
+}
+
+void serviceConnectivity(std::uint32_t nowMillis) {
+  applyPendingNtpTime();
+
+  const bool wifiIsConfigured = std::strlen(WIFI_SSID) > 0;
+  if (!wifiIsConfigured) {
+    return;
+  }
+
+  g_wifiConnected = WiFi.status() == WL_CONNECTED;
+  if (!g_wifiConnected) {
+    return;
+  }
+
+  const bool mdnsRetryDue =
+      !g_mdnsAttempted || nowMillis - g_lastMdnsAttemptMillis >= kNetworkRetryMillis;
+  const bool shouldStartMdns = !g_mdnsStarted && mdnsRetryDue;
+  if (shouldStartMdns) {
+    const bool shouldResetPartialMdns = g_mdnsAttempted;
+    if (shouldResetPartialMdns) {
+      MDNS.end();
+    }
+    g_mdnsAttempted = true;
+    g_lastMdnsAttemptMillis = nowMillis;
+    g_mdnsStarted = MDNS.begin(g_hostName.data());
+  }
+
+  const bool shouldConfigureNtp = !g_ntpConfigured;
+  if (shouldConfigureNtp) {
+    configureNtpSynchronization();
+  }
+
+  const bool geoIpEnabled = GEOIP_ENABLED;
+  if (!geoIpEnabled) {
+    return;
+  }
+  const bool geoIpRetryDue =
+      !g_geoIpAttempted || nowMillis - g_lastGeoIpAttemptMillis >= kNetworkRetryMillis;
+  const bool controlIsIdle = g_state.phase == app::Phase::Tracking && g_lastTickServoSettled;
+  const bool shouldRefreshGeoIp = geoIpRetryDue && controlIsIdle;
+  if (shouldRefreshGeoIp) {
+    refreshGeoIpLocation();
+  }
+}
+
+// RTCで即時起動し、Wi-FiがあればNTPで補正してからGeoIPを更新する。
 //
-// CoreS3 は RTC を積んでいるので、一度合わせれば電源を切っても保たれる。
-// Wi-Fi が無い場所でも天体を指せるようにするため、まず RTC を見る。
+// Why not RTCが有効ならreturnする: RTCの経年誤差が永久に補正されず、Wi-Fi対応でも
+// 天体時刻が徐々にずれる。RTCはオフライン用の初期値、NTPはオンライン時の正本。
 void syncTime() {
-  // ホストのビルド時刻で RTC を合わせる。
-  //
-  // Wi-Fi の無い場所でも天体を指せるようにするための手段。just set-time で
-  // 書き込むと、そのビルドの時刻が RTC に入る。数秒の誤差は天体の方位に
-  // 換算して 0.001 度未満なので、この用途には十分。
+  // BUILD_UNIX_TIMEを明示した外部ビルドでは、その値を起動時の予備時刻にする。
+  // 通常のjust set-timeは書き込み時間を予測せず、起動後にUSBで現在時刻を送る。
 #ifdef BUILD_UNIX_TIME
   {
     Preferences stamp;
-    if (stamp.begin("clock", false)) {
+    const bool opened = stamp.begin("clock", false);
+    if (opened) {
       const int storedBuild = stamp.getInt("build", 0);
-      if (storedBuild != BUILD_UNIX_TIME) {
-        stamp.putInt("build", BUILD_UNIX_TIME);
+      const bool buildTimeIsNew = storedBuild != BUILD_UNIX_TIME;
+      if (buildTimeIsNew) {
         const std::time_t buildTime = BUILD_UNIX_TIME;
-        const std::tm* utc = std::gmtime(&buildTime);
-        if (utc != nullptr) {
-          m5::rtc_datetime_t rtc;
-          rtc.date.year = static_cast<std::uint16_t>(utc->tm_year + 1900);
-          rtc.date.month = static_cast<std::uint8_t>(utc->tm_mon + 1);
-          rtc.date.date = static_cast<std::uint8_t>(utc->tm_mday);
-          rtc.time.hours = static_cast<std::uint8_t>(utc->tm_hour);
-          rtc.time.minutes = static_cast<std::uint8_t>(utc->tm_min);
-          rtc.time.seconds = static_cast<std::uint8_t>(utc->tm_sec);
-          M5.Rtc.setDateTime(rtc);
+        const bool clockSet = setClockFromUnix(buildTime);
+        if (clockSet) {
+          stamp.putInt("build", BUILD_UNIX_TIME);
         }
       }
       stamp.end();
@@ -280,90 +824,37 @@ void syncTime() {
   }
 #endif
 
-  // RTC に妥当な時刻が入っていれば、それを使う。
-  auto rtcDate = M5.Rtc.getDateTime();
-  if (rtcDate.date.year >= 2024) {
-    std::tm timeInfo = {};
-    timeInfo.tm_year = rtcDate.date.year - 1900;
-    timeInfo.tm_mon = rtcDate.date.month - 1;
-    timeInfo.tm_mday = rtcDate.date.date;
-    timeInfo.tm_hour = rtcDate.time.hours;
-    timeInfo.tm_min = rtcDate.time.minutes;
-    timeInfo.tm_sec = rtcDate.time.seconds;
-    // RTC は UTC で持つ。timegm がないので mktime との差で補正する。
-    const std::time_t asLocal = std::mktime(&timeInfo);
-    std::tm probe = {};
-    probe.tm_year = 70;
-    probe.tm_mon = 0;
-    probe.tm_mday = 1;
-    const std::time_t epochOffset = std::mktime(&probe);
-    const std::time_t utc = asLocal - epochOffset;
-    if (utc > 1700000000) {
-      timeval now = {utc, 0};
-      settimeofday(&now, nullptr);
-      g_timeValid = true;
-      return;
-    }
-  }
-
-  if (std::strlen(WIFI_SSID) == 0) {
-    return;
-  }
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  const std::uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < kWifiTimeoutMillis) {
-    delay(200);
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  configTime(0, 0, "ntp.nict.jp", "pool.ntp.org");
-  const std::uint32_t ntpStart = millis();
-  while (millis() - ntpStart < 10000) {
-    if (std::time(nullptr) > 1700000000) {
-      g_timeValid = true;
-      // 次回は Wi-Fi 無しでも動くよう RTC に残す。
-      const std::time_t now = std::time(nullptr);
-      const std::tm* utc = std::gmtime(&now);
-      if (utc != nullptr) {
-        m5::rtc_datetime_t rtc;
-        rtc.date.year = static_cast<std::uint16_t>(utc->tm_year + 1900);
-        rtc.date.month = static_cast<std::uint8_t>(utc->tm_mon + 1);
-        rtc.date.date = static_cast<std::uint8_t>(utc->tm_mday);
-        rtc.time.hours = static_cast<std::uint8_t>(utc->tm_hour);
-        rtc.time.minutes = static_cast<std::uint8_t>(utc->tm_min);
-        rtc.time.seconds = static_cast<std::uint8_t>(utc->tm_sec);
-        M5.Rtc.setDateTime(rtc);
-      }
-      return;
-    }
-    delay(200);
-  }
+  loadClockFromRtc();
+  loadStoredGeoIp();
+  startWifi();
 }
 
-// 実際の首の角度。UART 越しなのでコストが高く、間隔を空けて読む。
+// 実際の首の角度。UART 越しなのでコストが高く、両軸を一度に間隔を空けて読む。
 //
 // Why not 指令値: Tracking 中は deadband 内なら move() を呼ばないので、
 // 指令値は古い角度のまま取り残される。ゲートが姿勢を誤判定して測定を弾く。
-int currentYawDeci(std::uint32_t nowMillis) {
-  static int cachedYaw = 0;
+ServoAngles currentServoAngles(std::uint32_t nowMillis) {
+  static ServoAngles cached;
   static std::uint32_t lastReadMillis = 0;
   constexpr std::uint32_t kReadIntervalMillis = 200;
 
-  if (nowMillis - lastReadMillis >= kReadIntervalMillis) {
+  const bool readDue = nowMillis - lastReadMillis >= kReadIntervalMillis;
+  if (readDue) {
     lastReadMillis = nowMillis;
-    cachedYaw = M5StackChan.Motion.getCurrentYawAngle();
+    const auto angles = M5StackChan.Motion.getCurrentAngles();
+    cached.yawDeci = angles.x;
+    cached.pitchDeci = angles.y;
   }
-  return cachedYaw;
+  return cached;
 }
 
 // 首が動いているかを、実際の角度の変化で判定する。
 //
 // Why not 指令からの経過時間: 指令のたび一定時間を無条件で動作中とすると、
 // 首が既に目標にいる場合まで動作中扱いになり、磁気が一切採用されない。
-bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
+bool servoLikelyMoving(std::uint32_t nowMillis, const ServoAngles& actual) {
   static int lastYaw = 0;
+  static int lastPitch = pointing::kPitchLevelDeci;
   static std::uint32_t lastChangeMillis = 0;
 
   // 保持中の微振動を「動いている」と誤判定しない幅。
@@ -372,8 +863,12 @@ bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
   // 数度の範囲で揺れ続ける。実測の静定精度は 8.7 度あった。0.5 度で判定すると
   // 永久に動作中と見なされ、磁気が一切採用されない (実機で発生)。
   constexpr int kMovementThresholdDeci = 30;
-  if (std::abs(actualYaw - lastYaw) > kMovementThresholdDeci) {
-    lastYaw = actualYaw;
+  const bool yawMoved = std::abs(actual.yawDeci - lastYaw) > kMovementThresholdDeci;
+  const bool pitchMoved = std::abs(actual.pitchDeci - lastPitch) > kMovementThresholdDeci;
+  const bool eitherAxisMoved = yawMoved || pitchMoved;
+  if (eitherAxisMoved) {
+    lastYaw = actual.yawDeci;
+    lastPitch = actual.pitchDeci;
     lastChangeMillis = nowMillis;
     return true;
   }
@@ -389,8 +884,9 @@ bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
 // 指令値だけだと起動直後 (g_commandedYaw = 0) に測定姿勢の指令と一致して
 // move() が一度も出ず、到達済みだけだと次に動かすべき角度を見逃すため。
 // 同じ指令の再発行は servoLikelyMoving() を真に戻し、フィルタが溜まらなくなる。
-void commandServo(int yawDeci, int pitchDeci, int actualYaw) {
-  const bool alreadyThere = std::abs(actualYaw - yawDeci) <= compass::kMeasurementYawToleranceDeci;
+void commandServo(int yawDeci, int pitchDeci, const ServoAngles& actual) {
+  const bool alreadyThere = pointing::isServoAtTarget(actual.yawDeci, actual.pitchDeci, yawDeci,
+                                                      pitchDeci, kServoArrivalToleranceDeci);
   const bool unchanged = yawDeci == g_commandedYaw && pitchDeci == g_commandedPitch;
   if (alreadyThere && unchanged) {
     return;
@@ -405,11 +901,10 @@ void commandServo(int yawDeci, int pitchDeci, int actualYaw) {
 
   g_commandedYaw = yawDeci;
   g_commandedPitch = pitchDeci;
-  g_lastServoCommandMillis = millis();
   M5StackChan.Motion.move(yawDeci, pitchDeci, kMoveSpeed);
 }
 
-void applyServoIntent(const app::ServoIntent& intent, int actualYaw) {
+void applyServoIntent(const app::ServoIntent& intent, const ServoAngles& actual) {
   static app::Phase lastPhase = app::Phase::Error;
   const bool phaseChanged = g_state.phase != lastPhase;
   lastPhase = g_state.phase;
@@ -423,15 +918,72 @@ void applyServoIntent(const app::ServoIntent& intent, int actualYaw) {
   //
   // commandServo() 側が「到達済みかつ同じ指令なら何もしない」ので、
   // 無駄な再発行にはならない。
-  const bool notThereYet =
-      std::abs(actualYaw - intent.yawDeciDegrees) > compass::kMeasurementYawToleranceDeci;
+  const bool atTarget =
+      pointing::isServoAtTarget(actual.yawDeci, actual.pitchDeci, intent.yawDeciDegrees,
+                                intent.pitchDeciDegrees, kServoArrivalToleranceDeci);
+  const bool notThereYet = !atTarget;
 
   if (intent.shouldMove || phaseChanged || notThereYet) {
-    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees, actualYaw);
+    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees, actual);
   }
 }
 
 app::Input readInput() {
+  static bool readingClock = false;
+  static char clockDigits[16] = {};
+  static std::size_t clockDigitCount = 0;
+
+  while (Serial.available() > 0) {
+    const int serialCommand = Serial.read();
+
+    if (readingClock) {
+      const bool isDigit = serialCommand >= '0' && serialCommand <= '9';
+      const bool hasRoom = clockDigitCount + 1 < sizeof(clockDigits);
+      if (isDigit && hasRoom) {
+        clockDigits[clockDigitCount++] = static_cast<char>(serialCommand);
+        continue;
+      }
+
+      const bool isLineEnd = serialCommand == '\n' || serialCommand == '\r';
+      const bool hasClockValue = clockDigitCount > 0;
+      if (isLineEnd && hasClockValue) {
+        clockDigits[clockDigitCount] = '\0';
+        const auto requested = static_cast<std::time_t>(std::strtoll(clockDigits, nullptr, 10));
+        const bool clockSet = setClockFromUnix(requested);
+        if (clockSet) {
+          Serial.printf("clock=%lld\n", static_cast<long long>(requested));
+        } else {
+          Serial.println("clock=invalid");
+        }
+      }
+      readingClock = false;
+      clockDigitCount = 0;
+      if (isLineEnd) {
+        continue;
+      }
+    }
+
+    const bool startsClockCommand = serialCommand == 'T';
+    if (startsClockCommand) {
+      readingClock = true;
+      clockDigitCount = 0;
+      continue;
+    }
+
+    const bool requestsForward = serialCommand == '>';
+    if (requestsForward) {
+      return app::Input::SwipeForward;
+    }
+    const bool requestsBackward = serialCommand == '<';
+    if (requestsBackward) {
+      return app::Input::SwipeBackward;
+    }
+    const bool requestsClick = serialCommand == ' ';
+    if (requestsClick) {
+      return app::Input::Click;
+    }
+  }
+
   // 触れられているかどうかを、ジェスチャ判定とは別に記録する。
   // スワイプが効かないとき、センサに届いていないのか、ジェスチャとして
   // 認識されていないのかを切り分けるため。
@@ -462,12 +1014,19 @@ app::Input readInput() {
 // 首が正面にないときの値はフィルタに入れない。ゲートは「採用するか」しか
 // 見ないので、首を振っている間の値を溜めると、正面に戻った頃には平均が
 // 汚染されていて、ゲートを通った瞬間に誤った方位を採用してしまう。
-void updateHeading(int yawDeci, std::uint32_t nowMillis) {
+void updateHeading(const ServoAngles& actual, std::uint32_t nowMillis, bool servoInertiaSettled) {
+  const bool hasFatalError = g_state.phase == app::Phase::Error;
+  if (hasFatalError) {
+    return;
+  }
   if ((M5.Imu.update() & m5::IMU_Class::sensor_mask_mag) == 0) {
     return;
   }
 
   const compass::Vec3 raw = readMag();
+  const compass::Vec3 accel = readAccel();
+  g_lastRawMag = raw;
+  g_lastAccel = accel;
   if (g_state.phase == app::Phase::Calibrating) {
     // 姿勢が変わっていないサンプルだけを採る。
     //
@@ -477,74 +1036,103 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
     //
     // 大事なのは絶対的な水平ではなく、回している間に姿勢が変わらないこと。
     // 傾きが一定なら、磁石との相対関係も一定に保たれ、円が描ける。
-    const compass::Vec3 accel = readAccel();
-    const float tilt = accel.z / std::max(0.001F, compass::magnitude(accel));
+    const float accelMagnitude = compass::magnitude(accel);
+    const bool hasUsableGravity = accelMagnitude > 0.5F;
+    if (!hasUsableGravity) {
+      return;
+    }
+    const compass::Vec3 gravity = {accel.x / accelMagnitude, accel.y / accelMagnitude,
+                                   accel.z / accelMagnitude};
     // 基準の姿勢は、サンプルを集め始めた時点のもの。
     //
-    // Why not static で持ち続ける: キャリブレーションをやり直しても最初の値が
+    // Why not 起動時の値を持ち続ける: キャリブレーションをやり直しても最初の値が
     // 残り、書き込み直後のたまたまの姿勢が基準になる。実機では傾き 1 度以内に
     // 絞ったつもりで Z が 90uT 動いていた。集め直すたびに取り直す。
     if (g_calibrationCount == 0) {
-      g_referenceTilt = tilt;
+      g_referenceGravity = gravity;
     }
-    const float referenceTilt = g_referenceTilt;
-    // 姿勢の許容を狭くする。実機では 5 度の揺れでも、補正後の半径が
-    // 2〜22uT に散らばって方位誤差 23 度になった。回転面がぶれると
-    // 断面の半径が変わるため、傾きに対する感度が高い。
-    const bool attitudeHeld = std::fabs(tilt - referenceTilt) < 0.02F; // 約 1 度
-    if (attitudeHeld && g_calibrationSamples != nullptr &&
-        g_calibrationCount < kCalibrationCapacity) {
-      g_calibrationSamples[g_calibrationCount++] = raw;
+    // 重力ベクトル全体のなす角で見る。Zだけでは、同じ傾斜角のまま横へ
+    // 倒れた姿勢を区別できず、別の回転面を同じ円へ混ぜてしまう。
+    const float gravityDot = gravity.x * g_referenceGravity.x + gravity.y * g_referenceGravity.y +
+                             gravity.z * g_referenceGravity.z;
+    constexpr float kCosOneDegree = 0.9998477F;
+    const bool attitudeHeld = gravityDot >= kCosOneDegree;
+    if (!attitudeHeld) {
+      // Why not 不一致点だけ捨てる: 起動直後に持ち上げた1点が基準になると、机へ
+      // 置いた後の全点が不一致になり、最小24点へ永久に届かない。集合ごと捨て、
+      // 次周期の静止姿勢を新しい回転面として採り直す。
+      g_calibrationCount = 0;
+      g_calibrationCoverage = 0.0F;
+      return;
+    }
+    const bool hasSampleStorage = g_calibrationSamples != nullptr;
+    const bool hasSampleCapacity = g_calibrationCount < kCalibrationCapacity;
+    if (hasSampleStorage && hasSampleCapacity) {
+      const compass::Attitude attitude = compass::attitudeFromAccel(accel);
+      g_calibrationSamples[g_calibrationCount++] =
+          compass::horizontalMagneticComponents(raw, attitude);
     }
     return;
   }
 
-  // サーボが動いている最中の値は使えない。磁場が揺れている。
-  if (servoLikelyMoving(nowMillis, yawDeci)) {
+  // 位置が止まった直後も、顔側IMUには首の慣性振動が残る。
+  // 磁気フィルタとバイアス学習のどちらにも、その期間の値を入れない。
+  if (!servoInertiaSettled) {
     return;
   }
 
-  // 3x3 が使えるならそちらを優先する。対角では実機の歪みを直しきれない。
-  const compass::Vec3 corrected = g_ellipsoid.valid ? compass::applyEllipsoid(g_ellipsoid, raw)
-                                                    : compass::applyCalibration(g_calibration, raw);
-  const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
-  const float measured = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
+  const int yawDeci = actual.yawDeci;
+
+  const compass::Vec3 corrected = correctedHorizontalField(raw, accel);
+  const float measured = compass::headingDegreesFromHorizontal(corrected);
 
   const bool atMeasurePose = compass::isMeasurementPose(yawDeci);
 
   // 首が正面なら、その値がそのまま機体の方位。バイアス表の基準にもなる。
   if (atMeasurePose) {
     g_headingFilter.update(measured);
-    g_gate.learnReferenceField(compass::magnitude(raw));
     if (g_headingFilter.hasConverged(8)) {
       g_measurePoseHeading = g_headingFilter.valueDegrees();
+      g_measurePoseHeadingMillis = nowMillis;
       g_hasMeasurePoseHeading = true;
     }
     return;
   }
 
-  // 首が横を向いている。バイアス表があれば補正して使う。持ち歩きながら
-  // 指し続けるには、指した姿勢のままでも方位を追い続ける必要がある。
-  if (g_biasTable.isPopulated()) {
-    const float correction = g_biasTable.correctionDegrees(yawDeci);
-    g_headingFilter.update(compass::normalizeDegrees(measured - correction));
-    return;
+  // 首が横を向いている。まず、覚えられる状況なら覚える。
+  //
+  // Why not 覚え終わったら学習をやめる: 首の角度ごとのずれは 1 回の観測では
+  // 決まらないし、置き方でも変わる。使いながら測り続けて精度を上げる。
+  // 表が育つほど、指したままでも正しい方位が読めるようになる。
+  const bool basisIsFresh =
+      g_hasMeasurePoseHeading && nowMillis - g_measurePoseHeadingMillis < kBiasBasisValidMillis;
+  const bool bodyStill = readGyroMagnitude() < g_config.bodyMovedGyroDegPerSec;
+  const bool canLearnBias = basisIsFresh && bodyStill;
+  if (canLearnBias) {
+    const bool shouldPersistObservation = g_biasTable.observe(
+        yawDeci, compass::signedAngleDifference(measured, g_measurePoseHeading));
+    g_biasDirty = g_biasDirty || shouldPersistObservation;
   }
 
-  // 表がまだ無いので学習する。正面で採った方位を真値とみなし、ここでの
-  // ずれを角度ごとに覚える。機体が動いていないことが前提なので、
-  // ジャイロが静かなときだけ採る。
-  if (!g_hasMeasurePoseHeading) {
-    return;
+  // その角度を実際に覚えていれば補正して使う。持ち歩きながら指し続けるには、
+  // 指した姿勢のままでも方位を追い続ける必要がある。
+  //
+  // Why not 隣のビンの値を借りる: 実機で試したところ、未学習の角度に首が
+  // 向いた瞬間に方位が 270 度飛んだ。誤差は角度に比例して増えるので、
+  // 借り物では足りない。覚えていない角度では素直に諦める。
+  const bool hasLearnedBias = g_biasTable.hasObservationFor(yawDeci);
+  if (hasLearnedBias) {
+    const float correction = g_biasTable.correctionDegrees(yawDeci);
+    g_headingFilter.update(compass::normalizeDegrees(measured - correction));
+    // 学習済みの角度も補正後は機体方位の基準になる。ここを更新しないと、
+    // A(学習済み)→B(未学習)の巡回でBへ渡す新鮮な基準がなく、同じ順では
+    // Bが永久に未学習のまま残る。
+    if (g_headingFilter.hasConverged(8)) {
+      g_measurePoseHeading = g_headingFilter.valueDegrees();
+      g_measurePoseHeadingMillis = nowMillis;
+      g_hasMeasurePoseHeading = true;
+    }
   }
-  const bool bodyStill = readGyroMagnitude() < g_config.bodyMovedGyroDegPerSec;
-  if (!bodyStill) {
-    return;
-  }
-  g_biasTable.observe(yawDeci, compass::signedAngleDifference(measured, g_measurePoseHeading));
-  // 保存は学習が終わってから 1 回だけ。ここで書くと、ビンが埋まる周期と
-  // NVS の書き込みが重なってウォッチドッグを踏む。
-  g_biasDirty = true;
 }
 
 // キャリブレーションの完了判定。当てはめが重いので間隔を空けて呼ぶこと。
@@ -555,88 +1143,27 @@ void tryFinishCalibration() {
                               ? 1.0F
                               : compass::angularCoverage(g_calibrationSamples, g_calibrationCount,
                                                          calibration.offsetX, calibration.offsetY);
-  if (!calibration.valid || calibration.radius < kMinFieldRadiusMicroTesla) {
-    return;
-  }
-  if (calibration.normalizedResidual >= kMaxCalibrationResidual) {
+  const bool calibrationAccepted = isLevelCalibrationAcceptable(calibration);
+  if (!calibrationAccepted) {
+    const bool bufferIsFull = g_calibrationCount >= kCalibrationCapacity;
+    if (bufferIsFull) {
+      // Why not 古い点へ上書き: 異なる回転面を同じ円へ混ぜると中心が実在しない
+      // 位置へ寄る。集合ごと捨て、次のサンプルを新しい重力基準にする。
+      g_calibrationCount = 0;
+      g_calibrationCoverage = 0.0F;
+    }
     return;
   }
 
   g_level = calibration;
-  saveLevel(calibration);
+  const bool levelSaved = saveLevel(calibration);
+  if (!levelSaved) {
+    Serial.println("level-save=failed");
+  }
   g_headingFilter.reset();
 }
 
 m5avatar::Avatar g_avatar;
-
-// 天体の日本語名。画面に出すのはこちらを使う。
-// astro::targetName() は英語のまま残す (シリアルログと verify が読む)。
-const char* targetNameJa(astro::Target target) {
-  switch (target) {
-  case astro::Target::North:
-    return "北";
-  case astro::Target::Sun:
-    return "太陽";
-  case astro::Target::Moon:
-    return "月";
-  case astro::Target::Mercury:
-    return "水星";
-  case astro::Target::Venus:
-    return "金星";
-  case astro::Target::Mars:
-    return "火星";
-  case astro::Target::Jupiter:
-    return "木星";
-  case astro::Target::Saturn:
-    return "土星";
-  case astro::Target::kCount:
-    break;
-  }
-  return "?";
-}
-
-// 指せているときのセリフ。天体ごとに変える。
-//
-// ここが「方角を教える道具」と「スタックチャン」の分かれ目なので、
-// 数値だけでなく、その天体らしい一言を添える。
-//
-// 吹き出しは幅が文字数で決まり、画面 (320px) からはみ出すと切れる。
-// 文字は 16px フォント x TEXT_SIZE 2 = 実質 32px 相当なので、
-// 全角 7 文字あたりが上限。
-const char* pointingSpeech(astro::Target target) {
-  switch (target) {
-  case astro::Target::North:
-    return "きたはこっち";
-  case astro::Target::Sun:
-    return "おひさま！";
-  case astro::Target::Moon:
-    return "月が綺麗だね";
-  case astro::Target::Mercury:
-    return "水星いるよ";
-  case astro::Target::Venus:
-    return "金星ピカピカ";
-  case astro::Target::Mars:
-    return "火星は赤いよ";
-  case astro::Target::Jupiter:
-    return "木星おおきい";
-  case astro::Target::Saturn:
-    return "土星のわっか";
-  case astro::Target::kCount:
-    break;
-  }
-  return "あっちだよ";
-}
-
-// 地平線の下にいるときのセリフ。方位は正しいが、見えない。
-const char* belowHorizonSpeech(astro::Target target) {
-  if (target == astro::Target::Sun) {
-    return "地球の裏だよ";
-  }
-  if (target == astro::Target::Moon) {
-    return "おやすみ中";
-  }
-  return "地平線の下";
-}
 
 // 状態を顔に反映する。
 //
@@ -646,39 +1173,25 @@ const char* belowHorizonSpeech(astro::Target target) {
 void updateFace() {
   // 吹き出しは毎周期渡すとちらつくので、変わったときだけ差し替える。
   static char lastSpeech[64] = {};
-  char speech[64] = {};
+  const app::FacePresentation presentation =
+      app::facePresentationFor(g_state, g_calibrationCoverage);
 
-  if (g_state.phase == app::Phase::Calibrating) {
+  switch (presentation.mood) {
+  case app::FaceMood::Doubt:
     g_avatar.setExpression(m5avatar::Expression::Doubt);
-    std::snprintf(speech, sizeof(speech), "回して %d%%",
-                  static_cast<int>(g_calibrationCoverage * 100.0F));
-  } else if (!g_state.lastPosition.valid) {
+    break;
+  case app::FaceMood::Sleepy:
     g_avatar.setExpression(m5avatar::Expression::Sleepy);
-    std::snprintf(speech, sizeof(speech), "時計がないの");
-  } else if (g_state.phase == app::Phase::LearningBias) {
-    // 首を振ってクセを覚えている最中。動かさないでほしい。
-    g_avatar.setExpression(m5avatar::Expression::Neutral);
-    std::snprintf(speech, sizeof(speech), "おぼえ中 %u/8",
-                  static_cast<unsigned>(g_biasTable.populatedBinCount()));
-  } else if (g_state.lastSolve.command.clampedYaw) {
-    // 首が届いていない。困った顔で、指せない方向へ目だけ向ける。
-    g_avatar.setExpression(m5avatar::Expression::Doubt);
-    std::snprintf(speech, sizeof(speech), "%sはうしろ", targetNameJa(g_state.target));
-  } else if (g_state.lastSolve.command.clampedPitch) {
-    g_avatar.setExpression(m5avatar::Expression::Doubt);
-    std::snprintf(speech, sizeof(speech), "%sはもっと上", targetNameJa(g_state.target));
-  } else if (!g_state.lastPosition.aboveHorizon) {
-    // 地平線の下。方位は正しいが見えないので、眠そうにしておく。
-    g_avatar.setExpression(m5avatar::Expression::Sleepy);
-    std::snprintf(speech, sizeof(speech), "%s", belowHorizonSpeech(g_state.target));
-  } else {
+    break;
+  case app::FaceMood::Happy:
     g_avatar.setExpression(m5avatar::Expression::Happy);
-    std::snprintf(speech, sizeof(speech), "%s", pointingSpeech(g_state.target));
+    break;
   }
 
-  if (std::strcmp(speech, lastSpeech) != 0) {
-    std::strncpy(lastSpeech, speech, sizeof(lastSpeech) - 1);
-    g_avatar.setSpeechText(speech);
+  const bool speechChanged = std::strcmp(presentation.speech.data(), lastSpeech) != 0;
+  if (speechChanged) {
+    std::snprintf(lastSpeech, sizeof(lastSpeech), "%s", presentation.speech.data());
+    g_avatar.setSpeechText(presentation.speech.data());
   }
 
   // 指せていない分だけ視線を寄せる。首が届かないことが表情で分かる。
@@ -701,8 +1214,10 @@ void updateFace() {
 } // namespace
 
 void setup() {
+  g_bootResetReason = esp_reset_reason();
   auto config = M5.config();
   M5.begin(config);
+  g_magnetometerHighAccuracy = configureMagnetometerForAccuracy();
   // 動作中の状態を読む唯一の手段。NVS はフラッシュ読み出しに esptool のリセットを
   // 伴うので、何度読んでも「起動直後」しか観測できず、指した結果が見えない。
   Serial.begin(115200);
@@ -726,7 +1241,6 @@ void setup() {
         static_cast<compass::Vec3*>(malloc(kCalibrationCapacity * sizeof(compass::Vec3)));
   }
 
-  loadCalibration();
   loadLevel();
   loadBiasTable();
   syncTime();
@@ -734,10 +1248,15 @@ void setup() {
   // 顔。以後 M5.Display へ直接書かない (Avatar が自前のスレッドで描くため)。
   g_avatar.init();
   // 吹き出しは日本語を出すので、既定の ASCII フォントでは化ける。
-  g_avatar.setSpeechFont(&fonts::lgfxJapanGothicP_16);
+  // Avatar の吹き出しは右寄せの固定位置で文字倍率も2固定。右端は
+  // 220 + textWidth + 2 なので、8pxフォントの全角6文字 (96px) までなら
+  // 320px画面に収まる。主語つき状態文も6文字以内に揃えている。
+  g_avatar.setSpeechFont(&fonts::lgfxJapanGothicP_8);
 
-  if (!g_level.valid) {
-    g_state.phase = app::Phase::Calibrating;
+  const bool needsCalibration = !g_level.valid;
+  if (needsCalibration) {
+    const bool canCollectCalibration = g_calibrationSamples != nullptr;
+    g_state.phase = canCollectCalibration ? app::Phase::Calibrating : app::Phase::Error;
     g_calibrationCount = 0;
   }
 }
@@ -745,9 +1264,19 @@ void setup() {
 void loop() {
   M5StackChan.update();
   const std::uint32_t now = millis();
+  serviceConnectivity(now);
 
-  const int actualYaw = currentYawDeci(now);
-  updateHeading(actualYaw, now);
+  const ServoAngles actual = currentServoAngles(now);
+  const int actualYaw = actual.yawDeci;
+  const bool servoMoving = servoLikelyMoving(now, actual);
+  if (servoMoving) {
+    g_lastObservedServoMotionMillis = now;
+  }
+  // servoLikelyMoving() 自体が位置変化後500msを待つ。さらに同じ時間を置き、
+  // 位置が止まった後の慣性振動をセンサー判断へ混ぜない。
+  const bool servoInertiaSettled =
+      !servoMoving && now - g_lastObservedServoMotionMillis >= g_config.gyroAfterServoSettleMillis;
+  updateHeading(actual, now, servoInertiaSettled);
 
   static std::uint32_t lastFitMillis = 0;
   const bool shouldTryFit = g_state.phase == app::Phase::Calibrating &&
@@ -760,18 +1289,23 @@ void loop() {
 
   compass::MeasurementGate::Input gateInput;
   gateInput.nowMillis = now;
-  gateInput.servoMoving = servoLikelyMoving(now, actualYaw);
-  gateInput.gyroMagnitudeDegPerSec = readGyroMagnitude();
-  gateInput.fieldMagnitudeMicroTesla = compass::magnitude(readMag());
+  // 慣性待ちの間はサーボ動作中として先に棄却する。ジャイロ値を0にするのは、
+  // 読んでから無視するのではなく、この期間は判断材料にしないため。
+  gateInput.servoMoving = !servoInertiaSettled;
+  gateInput.gyroMagnitudeDegPerSec = servoInertiaSettled ? readGyroMagnitude() : 0.0F;
+  // updateHeading()と同じ磁気・加速度サンプルを使う。別々に読み直すと、巨大な
+  // 固定磁場を傾斜補正した値と分散判定の値が食い違い、原因を追えない。
+  const compass::Vec3 gateField = correctedHorizontalField(g_lastRawMag, g_lastAccel);
+  gateInput.fieldMagnitudeMicroTesla = compass::magnitude(gateField);
   gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
   gateInput.yawDeciDegrees = actualYaw;
-  gateInput.biasCorrected = g_biasTable.isPopulated();
+  gateInput.biasCorrected = g_biasTable.hasObservationFor(actualYaw);
 
-  // 停止した瞬間を 1 回だけ記録する。servoLikelyMoving() が静穏を確かめた上で
-  // false を返すので、ゲート側の settle をさらに課すと待ちが二重になる。
+  // 停止した瞬間を 1 回だけ記録する。ここへ来るまでに慣性待ちを済ませているので、
+  // その待ち時間を差し引き、ゲート側で同じ待ちを重ねない。
   static bool wasMoving = false;
   if (wasMoving && !gateInput.servoMoving) {
-    g_lastServoStopMillis = now - g_config.servoSettleMillis;
+    g_lastServoStopMillis = now - g_config.gyroAfterServoSettleMillis;
   }
   wasMoving = gateInput.servoMoving;
   gateInput.lastServoStopMillis = g_lastServoStopMillis;
@@ -780,8 +1314,17 @@ void loop() {
   // 採用すると方位が大きく揺れる。
   constexpr std::size_t kMinimumSamples = 8;
   const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
-  if (reject == compass::MeasurementGate::Reject::None &&
-      g_headingFilter.hasConverged(kMinimumSamples)) {
+  const bool measurementAccepted = reject == compass::MeasurementGate::Reject::None;
+  const bool headingConverged = g_headingFilter.hasConverged(kMinimumSamples);
+  const bool atMeasurementPose = compass::isMeasurementPose(actualYaw);
+  const bool canLearnReference =
+      measurementAccepted && headingConverged && atMeasurementPose && g_level.valid;
+  if (canLearnReference) {
+    // 異常値を先に基準へ混ぜると、近づけた磁石そのものへ追従してしまう。
+    // ゲートを通った正面サンプルだけで、校正後の水平磁場強度を学ぶ。
+    g_gate.learnReferenceField(gateInput.fieldMagnitudeMicroTesla);
+  }
+  if (measurementAccepted && headingConverged) {
     g_bodyTrueHeading =
         compass::trueHeadingFromMagnetic(g_headingFilter.valueDegrees(), kSiteDeclinationEast);
     g_headingValid = true;
@@ -795,24 +1338,26 @@ void loop() {
   tick.input = readInput();
   tick.bodyTrueHeadingDegrees = g_bodyTrueHeading;
   tick.headingValid = g_headingValid;
-  tick.measurementAccepted = reject == compass::MeasurementGate::Reject::None;
+  tick.measurementAccepted = measurementAccepted;
   tick.lastReject = reject;
   tick.gyroMagnitudeDegPerSec = gateInput.gyroMagnitudeDegPerSec;
-  tick.servoSettled = !gateInput.servoMoving;
-  tick.biasCorrected = g_biasTable.isPopulated();
-  g_lastTickServoSettled = tick.servoSettled;
+  // State側も同じ慣性待ちを単体で保証できるよう、ここでは元のサーボ静止だけを渡す。
+  // ジャイロ値自体はservoInertiaSettledまで読まないため、二重に待つことはない。
+  tick.servoSettled = !servoMoving;
+  tick.biasCorrected = g_biasTable.hasObservationFor(actualYaw);
+  g_lastTickServoSettled = servoInertiaSettled;
 
-  const app::Phase phaseBefore = g_state.phase;
   app::step(g_state, tick, g_config, g_observer);
-  applyServoIntent(app::servoIntentFor(g_state), actualYaw);
+  applyServoIntent(app::servoIntentFor(g_state), actual);
 
-  // 学習を抜けた瞬間に 1 回だけ保存する。
-  // ビンが埋まるたびに書くと、サーボを動かしながらフラッシュに書くことになり、
-  // 実機ではそこで応答が止まった。
-  const bool leftLearning =
-      phaseBefore == app::Phase::LearningBias && g_state.phase != app::Phase::LearningBias;
-  if (leftLearning && g_biasDirty) {
-    saveBiasTable();
+  // 新しい区画を覚えたときだけ、サーボが静かな周期にまとめて保存する。
+  // 観測ごとに書くとフラッシュを摩耗させ、実機では応答停止も起きた。
+  static std::uint32_t lastBiasSaveMillis = 0;
+  const bool biasSaveDue =
+      g_biasDirty && servoInertiaSettled && now - lastBiasSaveMillis >= kBiasSaveIntervalMillis;
+  const bool biasSaved = biasSaveDue && saveBiasTable();
+  if (biasSaved) {
+    lastBiasSaveMillis = now;
     g_biasDirty = false;
   }
 
@@ -831,8 +1376,10 @@ void loop() {
     //
     // 機体の向きは state 側の採用済みの値を使う。g_bodyTrueHeading は首を振ると
     // 更新が止まるので、指した直後の検証に使うと古い値が混ざる。
-    const int yawDeci = currentYawDeci(now);
+    const int yawDeci = actual.yawDeci;
+    const int pitchDeci = actual.pitchDeci;
     const float neckAbsolute = g_state.bodyHeadingDegrees + static_cast<float>(yawDeci) / 10.0F;
+    const double neckAltitude = pointing::altitudeFromPitchDeci(pitchDeci);
 
     // NVS はフラッシュなので、シリアルと同じ頻度で書くと摩耗する。
     static std::uint32_t lastNvsMillis = 0;
@@ -852,9 +1399,16 @@ void loop() {
       probe.putInt("inPhase", static_cast<int>(now - g_state.phaseEnteredMillis));
       probe.putInt("settled", g_lastTickServoSettled ? 1 : 0);
       probe.putInt("yaw", yawDeci);
+      probe.putInt("pitch", pitchDeci);
+      probe.putInt("cmdYaw", g_commandedYaw);
+      probe.putInt("cmdPitch", g_commandedPitch);
       probe.putInt("neckAbs", static_cast<int>(std::lround(neckAbsolute * 10.0F)));
+      probe.putInt("neckAlt", static_cast<int>(std::lround(neckAltitude * 10.0)));
       probe.putInt("tgtAz", static_cast<int>(std::lround(
                                 g_state.lastPosition.horizontal.azimuthDegrees * 10.0F)));
+      probe.putInt("eph", static_cast<int>(g_state.lastPosition.source));
+      probe.putInt("clampY", g_state.lastSolve.command.clampedYaw ? 1 : 0);
+      probe.putInt("clampP", g_state.lastSolve.command.clampedPitch ? 1 : 0);
       // 時刻が入っているかと、いま指しているターゲット。
       probe.putInt("timeOk", g_timeValid ? 1 : 0);
       probe.putInt("target", static_cast<int>(g_state.target));
@@ -868,18 +1422,43 @@ void loop() {
     //
     // nS と settled は「rej=0 なのに hdgOk=0」を切り分けるために要る。
     // ゲートを通っていても、フィルタが溜まっていなければ方位は確定しない。
-    Serial.printf("phase=%s target=%d rej=%d hdgOk=%d hdg=%.1f yaw=%d neckAbs=%.1f "
-                  "tgtAz=%.1f alt=%.1f timeOk=%d touchN=%d calN=%u nS=%u settled=%d "
-                  "tI=%03d tSeen=%d bias=%u\n",
-                  app::phaseName(g_state.phase), static_cast<int>(g_state.target),
-                  static_cast<int>(g_state.lastReject), g_headingValid ? 1 : 0,
-                  static_cast<double>(g_bodyTrueHeading), yawDeci,
-                  static_cast<double>(neckAbsolute), g_state.lastPosition.horizontal.azimuthDegrees,
-                  g_state.lastPosition.horizontal.altitudeDegrees, g_timeValid ? 1 : 0,
-                  g_touchEventCount, static_cast<unsigned>(g_calibrationCount),
-                  static_cast<unsigned>(g_headingFilter.sampleCount()),
-                  g_lastTickServoSettled ? 1 : 0, g_touchIntensity, g_touchSeenCount,
-                  static_cast<unsigned>(g_biasTable.populatedBinCount()));
+    Serial.printf(
+        "phase=%s up=%lu rst=%d target=%d rej=%d hdgOk=%d hdg=%.1f yaw=%d pitch=%d "
+        "cmdYaw=%d cmdPitch=%d neckAbs=%.1f neckAlt=%.1f tgtAz=%.1f alt=%.1f "
+        "eph=%s clampY=%d clampP=%d timeOk=%d touchN=%d calN=%u nS=%u "
+        "mean=%.1f disp=%.1f field=%.1f ref=%.1f mx=%.1f my=%.1f mz=%.1f "
+        "ax=%.3f ay=%.3f az=%.3f ox=%.1f oy=%.1f sx=%.3f sy=%.3f cx=%.3f "
+        "rad=%.1f err=%.3f magAcc=%d repXY=%u repZ=%u magMode=%u "
+        "wifi=%d mdns=%d ntp=%d host=%s loc=%s lat=%.4f lon=%.4f "
+        "settled=%d tI=%03d tSeen=%d bias=%u\n",
+        app::phaseName(g_state.phase), static_cast<unsigned long>(now),
+        static_cast<int>(g_bootResetReason), static_cast<int>(g_state.target),
+        static_cast<int>(g_state.lastReject), g_headingValid ? 1 : 0,
+        static_cast<double>(g_bodyTrueHeading), yawDeci, pitchDeci, g_commandedYaw,
+        g_commandedPitch, static_cast<double>(neckAbsolute), neckAltitude,
+        g_state.lastPosition.horizontal.azimuthDegrees,
+        g_state.lastPosition.horizontal.altitudeDegrees,
+        astro::ephemerisSourceName(g_state.lastPosition.source),
+        g_state.lastSolve.command.clampedYaw ? 1 : 0,
+        g_state.lastSolve.command.clampedPitch ? 1 : 0, g_timeValid ? 1 : 0, g_touchEventCount,
+        static_cast<unsigned>(g_calibrationCount),
+        static_cast<unsigned>(g_headingFilter.sampleCount()),
+        static_cast<double>(g_headingFilter.valueDegrees()),
+        static_cast<double>(g_headingFilter.dispersionDegrees()),
+        static_cast<double>(gateInput.fieldMagnitudeMicroTesla),
+        static_cast<double>(g_gate.referenceFieldMicroTesla()), static_cast<double>(g_lastRawMag.x),
+        static_cast<double>(g_lastRawMag.y), static_cast<double>(g_lastRawMag.z),
+        static_cast<double>(g_lastAccel.x), static_cast<double>(g_lastAccel.y),
+        static_cast<double>(g_lastAccel.z), static_cast<double>(g_level.offsetX),
+        static_cast<double>(g_level.offsetY), static_cast<double>(g_level.scaleX),
+        static_cast<double>(g_level.scaleY), static_cast<double>(g_level.crossAxis),
+        static_cast<double>(g_level.radius), static_cast<double>(g_level.normalizedResidual),
+        g_magnetometerHighAccuracy ? 1 : 0, static_cast<unsigned>(g_bmm150XyRepetitions),
+        static_cast<unsigned>(g_bmm150ZRepetitions), static_cast<unsigned>(g_bmm150OperationMode),
+        g_wifiConnected ? 1 : 0, g_wifiConnected && g_mdnsStarted ? 1 : 0,
+        g_ntpSynchronized ? 1 : 0, g_hostName.data(), locationSourceName(g_locationSource),
+        g_observer.latitudeDegrees, g_observer.longitudeEastDegrees, g_lastTickServoSettled ? 1 : 0,
+        g_touchIntensity, g_touchSeenCount, static_cast<unsigned>(g_biasTable.populatedBinCount()));
   }
 
   static std::uint32_t lastDraw = 0;

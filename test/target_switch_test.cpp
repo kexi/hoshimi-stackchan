@@ -16,7 +16,7 @@ namespace {
 constexpr double kTokyoLatitude = 35.681236;
 constexpr double kTokyoLongitudeEast = 139.767125;
 // 2026-08-11 12:00 JST。この時刻の天体配置で検証する。
-constexpr std::int64_t kNoonJst = 1786064400;
+constexpr std::int64_t kNoonJst = 1786417200;
 
 astro::Observer tokyoObserver() {
   astro::Observer observer;
@@ -34,7 +34,7 @@ app::Tick tickAt(std::uint32_t nowMillis) {
   tick.headingValid = true;
   tick.measurementAccepted = true;
   tick.servoSettled = true;
-  // 首のクセを覚え終えた定常状態で見る。学習そのものは app-test で見る。
+  // 現在の首角度を補正できる定常状態で見る。
   tick.biasCorrected = true;
   return tick;
 }

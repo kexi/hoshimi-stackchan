@@ -44,6 +44,43 @@ std::vector<compass::Vec3> fullTurn(int count, float scaleX = 1.0F, float scaleY
   return points;
 }
 
+compass::Vec3 tiltedRawSample(float headingDegrees, compass::Attitude attitude) {
+  const float heading = headingDegrees * kPi / 180.0F;
+  const float sinRoll = std::sin(attitude.rollRadians);
+  const float cosRoll = std::cos(attitude.rollRadians);
+  const float sinPitch = std::sin(attitude.pitchRadians);
+  const float cosPitch = std::cos(attitude.pitchRadians);
+
+  // heading.cppの水平化行列の転置で、水平座標の地磁気を機体座標へ戻す。
+  const float horizontalX = kHorizontalField * std::cos(heading);
+  const float horizontalY = -kHorizontalField * std::sin(heading);
+  const float vertical = kVerticalField;
+
+  compass::Vec3 raw;
+  raw.x = cosPitch * horizontalX - sinPitch * vertical + kHardIronX;
+  raw.y = sinRoll * sinPitch * horizontalX + cosRoll * horizontalY + sinRoll * cosPitch * vertical +
+          kHardIronY;
+  raw.z = cosRoll * sinPitch * horizontalX - sinRoll * horizontalY + cosRoll * cosPitch * vertical +
+          kHardIronZ;
+  return raw;
+}
+
+compass::Vec3 rotatedEllipseSample(float headingDegrees) {
+  constexpr float kMajorCorrection = 1.3F;
+  constexpr float kMinorCorrection = 0.75F;
+  constexpr float kAxisAngle = 32.0F * kPi / 180.0F;
+  const float cosine = std::cos(kAxisAngle);
+  const float sine = std::sin(kAxisAngle);
+  const float inverseXX = cosine * cosine / kMajorCorrection + sine * sine / kMinorCorrection;
+  const float inverseXY = cosine * sine * (1.0F / kMajorCorrection - 1.0F / kMinorCorrection);
+  const float inverseYY = sine * sine / kMajorCorrection + cosine * cosine / kMinorCorrection;
+  const float heading = headingDegrees * kPi / 180.0F;
+  const float idealX = kHorizontalField * std::cos(heading);
+  const float idealY = -kHorizontalField * std::sin(heading);
+  return compass::Vec3{kHardIronX + inverseXX * idealX + inverseXY * idealY,
+                       kHardIronY + inverseXY * idealX + inverseYY * idealY, kHardIronZ};
+}
+
 void testRecoversHardIronFromLevelTurn() {
   // 一回転すれば、地磁気の 6 倍のハードアイアンがあっても中心が求まる。
   // これが 8 の字回しとの違い。本体を傾けないので磁石との相対関係が保たれる。
@@ -90,6 +127,54 @@ void testCorrectsAxisSensitivityDifference() {
     const compass::Vec3 corrected = compass::applyLevelCalibration(calibration, raw);
     // 楕円を円に戻すので、補正しなければ数度ずれるところが 1 度以内に収まる
     CHECK_NEAR_ANGLE(compass::tiltCompensatedHeadingDegrees(corrected, level), heading, 1.0);
+  }
+}
+
+void testCorrectsRotatedAxisSensitivityDifference() {
+  // 軟鉄歪みの主軸がセンサーX/Yと一致しなくても、交差項を含めて補正すること。
+  std::vector<compass::Vec3> points;
+  points.reserve(72);
+  for (int step = 0; step < 72; ++step) {
+    points.push_back(rotatedEllipseSample(static_cast<float>(step) * 5.0F));
+  }
+  const compass::LevelCalibration calibration =
+      compass::fitLevelCircle(points.data(), points.size());
+  CHECK_TRUE(calibration.valid);
+  CHECK_TRUE(std::fabs(calibration.crossAxis) > 0.05F);
+
+  for (int step = 0; step < 12; ++step) {
+    const float heading = static_cast<float>(step) * 30.0F;
+    const compass::Vec3 corrected =
+        compass::applyLevelCalibration(calibration, rotatedEllipseSample(heading));
+    CHECK_NEAR_ANGLE(compass::headingDegreesFromHorizontal(corrected), heading, 1.0);
+  }
+}
+
+void testTiltedProjectionCorrectsThreeAxisHardIron() {
+  // CoreS3が傾いていてZにも強い固定磁場がある実機条件でも、先に水平投影すれば
+  // 固定磁場は円の中心となり、全方位を復元できること。
+  compass::Attitude attitude;
+  attitude.rollRadians = 18.0F * kPi / 180.0F;
+  attitude.pitchRadians = -37.0F * kPi / 180.0F;
+
+  std::vector<compass::Vec3> horizontalSamples;
+  horizontalSamples.reserve(72);
+  for (int step = 0; step < 72; ++step) {
+    const float heading = static_cast<float>(step) * 5.0F;
+    const compass::Vec3 raw = tiltedRawSample(heading, attitude);
+    horizontalSamples.push_back(compass::horizontalMagneticComponents(raw, attitude));
+  }
+
+  const compass::LevelCalibration calibration =
+      compass::fitLevelCircle(horizontalSamples.data(), horizontalSamples.size());
+  CHECK_TRUE(calibration.valid);
+
+  for (int step = 0; step < 12; ++step) {
+    const float heading = static_cast<float>(step) * 30.0F;
+    const compass::Vec3 raw = tiltedRawSample(heading, attitude);
+    const compass::Vec3 horizontal = compass::horizontalMagneticComponents(raw, attitude);
+    const compass::Vec3 corrected = compass::applyLevelCalibration(calibration, horizontal);
+    CHECK_NEAR_ANGLE(compass::headingDegreesFromHorizontal(corrected), heading, 0.5);
   }
 }
 
@@ -174,6 +259,8 @@ int main() {
   testRecoversHardIronFromLevelTurn();
   testCorrectedHeadingMatchesActual();
   testCorrectsAxisSensitivityDifference();
+  testCorrectsRotatedAxisSensitivityDifference();
+  testTiltedProjectionCorrectsThreeAxisHardIron();
   testRejectsPartialTurn();
   testCoverageReflectsRotation();
   testRejectsDegenerateInput();
