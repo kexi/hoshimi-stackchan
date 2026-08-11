@@ -1,0 +1,8 @@
+.pio/
+.platformio/
+build/
+.direnv/
+compile_commands.json
+firmware/sdkconfig.*
+firmware/src/wifi_config.h
+.DS_Store
