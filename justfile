@@ -45,7 +45,7 @@ set-time:
     now=$(python3 -c 'import time; print(int(time.time()) + 35)')
     PLATFORMIO_BUILD_FLAGS="-DBUILD_UNIX_TIME=${now}" \
       pio run --project-dir firmware --target upload --upload-port "$port"
-    echo "RTC を $(date -r ${now} '+%Y-%m-%d %H:%M:%S') に合わせました" 
+    echo "RTC を $(date -r "$now" '+%Y-%m-%d %H:%M:%S') に合わせました" 
 
 upload port='':
     pio run --project-dir firmware --target upload {{ if port == '' { '' } else { '--upload-port ' + port } }}
