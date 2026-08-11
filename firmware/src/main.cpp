@@ -75,6 +75,10 @@ compass::EllipsoidFit g_ellipsoid;
 compass::LevelCalibration g_level;
 // 直近の当てはめの被覆率。描画から読むだけにして、当てはめは間隔を空けて回す。
 float g_calibrationCoverage = 0.0F;
+// キャリブレーション開始時の姿勢。ここから外れたサンプルは採らない。
+float g_referenceTilt = 0.0F;
+// 直近の tick で サーボが静止していたか。診断用。
+bool g_lastTickServoSettled = false;
 compass::MeasurementGate g_gate;
 compass::HeadingFilter g_headingFilter{0.5F};
 
@@ -320,11 +324,16 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
     // 大事なのは絶対的な水平ではなく、回している間に姿勢が変わらないこと。
     // 傾きが一定なら、磁石との相対関係も一定に保たれ、円が描ける。
     const compass::Vec3 accel = readAccel();
-    static float referenceTilt = -1.0F;
     const float tilt = accel.z / std::max(0.001F, compass::magnitude(accel));
-    if (referenceTilt < -0.5F) {
-      referenceTilt = tilt;
+    // 基準の姿勢は、サンプルを集め始めた時点のもの。
+    //
+    // Why not static で持ち続ける: キャリブレーションをやり直しても最初の値が
+    // 残り、書き込み直後のたまたまの姿勢が基準になる。実機では傾き 1 度以内に
+    // 絞ったつもりで Z が 90uT 動いていた。集め直すたびに取り直す。
+    if (g_calibrationCount == 0) {
+      g_referenceTilt = tilt;
     }
+    const float referenceTilt = g_referenceTilt;
     // 姿勢の許容を狭くする。実機では 5 度の揺れでも、補正後の半径が
     // 2〜22uT に散らばって方位誤差 23 度になった。回転面がぶれると
     // 断面の半径が変わるため、傾きに対する感度が高い。
@@ -529,6 +538,7 @@ void loop() {
   tick.lastReject = reject;
   tick.gyroMagnitudeDegPerSec = gateInput.gyroMagnitudeDegPerSec;
   tick.servoSettled = !gateInput.servoMoving;
+  g_lastTickServoSettled = tick.servoSettled;
 
   app::step(g_state, tick, g_config, g_observer);
   applyServoIntent(app::servoIntentFor(g_state), actualYaw);
@@ -546,6 +556,15 @@ void loop() {
       probe.putInt("lvOk", g_level.valid ? 1 : 0);
       probe.putInt("lvR", static_cast<int>(std::lround(g_level.radius * 10.0F)));
       probe.putInt("lvRes", static_cast<int>(std::lround(g_level.normalizedResidual * 1000.0F)));
+      probe.putInt("hdgOk", g_headingValid ? 1 : 0);
+      probe.putInt("hdg", static_cast<int>(std::lround(g_bodyTrueHeading * 10.0F)));
+      probe.putInt("phase", static_cast<int>(g_state.phase));
+      probe.putInt("yaw", currentYawDeci(millis()));
+      probe.putInt("rej", static_cast<int>(g_state.lastReject));
+      probe.putInt("nS", static_cast<int>(g_headingFilter.sampleCount()));
+      // Pointing に入ってからの経過。抜けない理由の切り分け用。
+      probe.putInt("inPhase", static_cast<int>(millis() - g_state.phaseEnteredMillis));
+      probe.putInt("settled", g_lastTickServoSettled ? 1 : 0);
       probe.putInt("lvCov", static_cast<int>(std::lround(g_calibrationCoverage * 100.0F)));
       // 傾き判定に使っている値。閾値が実機に対して妥当かを見る。
       const compass::Vec3 accelProbe = readAccel();

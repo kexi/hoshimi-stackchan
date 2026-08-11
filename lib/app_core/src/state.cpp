@@ -204,6 +204,17 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
   }
 
   case Phase::Tracking: {
+    // 方位が無いまま追尾に入っていたら、すぐ測り直しへ戻る。
+    //
+    // Why not 再測定の周期を待つ: 方位が無効だと solveForTarget が解を作れず、
+    // servoIntentFor も shouldMove を返さない。首が動かないので機体の動きも
+    // 検出されず、周期が来るまで何もしないまま固まる。実機では首が -48 度の
+    // まま Tracking に留まり続けた。
+    if (!tick.headingValid) {
+      enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
+      return;
+    }
+
     // 機体ごと動かされたら方位が変わっているので測り直す。
     const bool bodyMoved = tick.gyroMagnitudeDegPerSec > config.bodyMovedGyroDegPerSec;
     if (bodyMoved) {

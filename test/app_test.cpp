@@ -182,6 +182,25 @@ void testClickTogglesAutoCycle() {
   CHECK_TRUE(!state.autoCycleEnabled);
 }
 
+void testTrackingEscapesWhenHeadingLost() {
+  // 方位が無いまま Tracking に入ったら、周期を待たずに測り直しへ戻ること。
+  //
+  // 方位が無効だと解が作れず、首も動かない。首が動かないので機体の動きも
+  // 検出されず、再測定の周期が来るまで固まる。実機では首が -48 度のまま
+  // Tracking に留まり続けた。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+
+  clock += 200;
+  app::Tick lost = healthyTick(clock);
+  lost.headingValid = false;
+  app::step(state, lost, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+}
+
 void testBodyMovementTriggersRemeasure() {
   app::State state;
   app::Config config;
@@ -330,6 +349,7 @@ int main() {
   testMeasurementTimeoutWithoutHeading();
   testSwipeChangesTarget();
   testClickTogglesAutoCycle();
+  testTrackingEscapesWhenHeadingLost();
   testBodyMovementTriggersRemeasure();
   testMillisWrapDoesNotBreakTransitions();
   testTrackingUpdatesAsSkyMoves();

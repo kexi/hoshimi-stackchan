@@ -43,13 +43,13 @@ inline constexpr int kMeasurementYawDeci = 0;
 // 正面からこの範囲に入っていれば測ってよい。
 //
 // 実測の傾きは 16 ビンで 119 度、つまり 1 ビン (16 度) あたり約 7 度。
-// ±5 度なら首の角度による誤差は 2 度程度に収まる。
+// ±10 度なら首の角度による誤差は 4 度程度に収まる。
 //
-// Why not ±2 度: サーボが正面へ戻ったときの静定位置は実測で -2.1 度あり、
-// 許容範囲の境界に張り付いた。0.1 度の超過で測定が弾かれ、フィルタが
-// 空のまま Measuring から抜けられなくなる (実機で発生)。
-// サーボの静定精度に対して余裕を持たせる。
-inline constexpr int kMeasurementYawToleranceDeci = 50;
+// Why not ±5 度: サーボが正面へ戻ったときの静定位置は実測で -8.7 度あり、
+// 許容範囲を超えて測定が弾かれ続けた。BSP のスプリング制御は臨界減衰で
+// オーバーシュートしない代わりに、目標へ漸近するので最後まで詰めない。
+// サーボの実力に合わせる。
+inline constexpr int kMeasurementYawToleranceDeci = 100;
 
 [[nodiscard]] bool isMeasurementPose(int yawDeciDegrees);
 
