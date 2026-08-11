@@ -37,6 +37,17 @@ add_library(
 target_include_directories(pointing_core PUBLIC lib/pointing_core/include)
 target_compile_options(pointing_core PRIVATE ${COMPASS_WARNINGS})
 
+# 状態機械。実機とシミュレータで同じものを動かす。
+add_library(app_core lib/app_core/src/state.cpp)
+target_include_directories(app_core PUBLIC lib/app_core/include)
+target_link_libraries(app_core PUBLIC astro_core compass_core pointing_core)
+target_compile_options(app_core PRIVATE ${COMPASS_WARNINGS})
+
+# 実機なしでロジックを目視確認するための CLI
+add_executable(compass-simulator host/simulator.cpp)
+target_link_libraries(compass-simulator PRIVATE app_core)
+target_compile_options(compass-simulator PRIVATE ${COMPASS_WARNINGS})
+
 include(CTest)
 if(BUILD_TESTING)
   foreach(suite astro compass pointing)
@@ -46,6 +57,12 @@ if(BUILD_TESTING)
     target_compile_options(${suite}-test PRIVATE ${COMPASS_WARNINGS})
     add_test(NAME ${suite}-test COMMAND ${suite}-test)
   endforeach()
+
+  add_executable(app-test test/app_test.cpp)
+  target_link_libraries(app-test PRIVATE app_core)
+  target_include_directories(app-test PRIVATE test)
+  target_compile_options(app-test PRIVATE ${COMPASS_WARNINGS})
+  add_test(NAME app-test COMMAND app-test)
 
   # 天体計算からサーボ指令までを通しで固定するゴールデンテスト
   add_executable(integration-test test/integration_test.cpp)
