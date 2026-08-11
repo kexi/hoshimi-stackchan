@@ -112,7 +112,7 @@ void testMeasurementTimeoutWithoutHeading() {
   CHECK_TRUE(state.phase == app::Phase::Measuring);
 
   // タイムアウトまで測れないまま進める
-  for (int step = 0; step < 40; ++step) {
+  for (int step = 0; step < 60; ++step) {
     clock += 200;
     app::Tick tick = healthyTick(clock);
     tick.measurementAccepted = false;

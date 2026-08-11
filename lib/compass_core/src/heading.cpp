@@ -81,7 +81,11 @@ float HeadingFilter::valueDegrees() const {
 
 float HeadingFilter::dispersionDegrees() const {
   if (!hasValue_) {
-    return 180.0F;
+    // 「まだ値が無い」は「ばらついている」とは違う。
+    // 180 を返すと、これを見るゲートが Unstable で弾いてしまい、
+    // 値が溜まる前に測定が打ち切られる (実機で方位が確定しなかった一因)。
+    // 呼び出し側は hasValue() で有無を判断すること。
+    return 0.0F;
   }
   // 平均ベクトルの長さ R は、値が揃っていれば 1、散らばるほど 0 に近づく。
   // 円周分散から標準偏差相当を出す (Mardia の circular standard deviation)。

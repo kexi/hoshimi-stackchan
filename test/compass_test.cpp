@@ -183,6 +183,12 @@ void testHeadingFilterIsCircular() {
 
   filter.reset();
   CHECK_TRUE(!filter.hasValue());
+
+  // 値が無い状態のばらつきは 0 を返すこと。
+  // 大きな値を返すと、これを見るゲートが「不安定」と誤判定し、
+  // 値が溜まる前に測定を打ち切ってしまう (実機で方位が確定しなかった一因)。
+  CHECK_NEAR(filter.dispersionDegrees(), 0.0, 1e-6);
+  CHECK_TRUE(!filter.hasValue()); // 有無の判断は hasValue() で行う
 }
 
 void testMeasurementGate() {

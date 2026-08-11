@@ -50,8 +50,10 @@ struct Config {
   // 汚れた方位がそのまま採用される。
   // 内訳: 首の移動 1200ms + 磁場の収束 300ms (実測) + 余裕。
   std::uint32_t measurePoseSettleMillis = 2000;
-  // 測定に使うサンプル数と、諦めるまでの時間。
-  std::uint32_t measureTimeoutMillis = 5000;
+  // 測定を諦めるまでの時間。
+  // 首が正面に落ち着いてからフィルタが溜まるまでを待てる長さにする。
+  // 短いと、まだ空のフィルタを見て「測れなかった」と判断してしまう。
+  std::uint32_t measureTimeoutMillis = 8000;
   // 機体が動かされたと判断するジャイロのしきい値。
   float bodyMovedGyroDegPerSec = 30.0F;
 };

@@ -50,7 +50,10 @@ astro::Observer g_observer;
 
 compass::MagCalibration g_calibration;
 compass::MeasurementGate g_gate;
-compass::HeadingFilter g_headingFilter{0.25F};
+// 平滑化を強めにするのは、測定のたびにフィルタが空から始まるため。
+// 弱いと 5 秒の測定窓では収束しきらず、ばらつきが大きいまま棄却され続ける。
+// BMM150 は 24Hz なので、0.5 なら 10 サンプル (0.4 秒) でほぼ収まる。
+compass::HeadingFilter g_headingFilter{0.5F};
 compass::CalibrationCollector g_collector;
 
 bool g_timeValid = false;
@@ -212,6 +215,50 @@ app::Input readInput() {
   return app::Input::None;
 }
 
+// 測定サイクル 1 回ぶんの生データを NVS に貯める。
+//
+// 実機の値を見ては一箇所ずつ直す進め方では原因が絞れなかったので、
+// 実機で起きたことをそのままホストへ持ち込んで再現できるようにする。
+// 貯めるのは首が正面にあるときの磁気と、そのときのゲートの判定。
+constexpr int kTraceSlots = 24;
+int g_traceCount = 0;
+bool g_traceDone = false;
+compass::MeasurementGate::Reject g_lastGateReject = compass::MeasurementGate::Reject::None;
+
+void appendTrace(const compass::Vec3& raw, const compass::Vec3& accel, int yawDeci,
+                 float headingDegrees, float dispersionDegrees, int rejectCode) {
+  // 一巡したら先頭へ戻る。1 回きりだと最初の測定サイクルしか見えず、
+  // その後どう変化したかが追えない。
+  if (g_traceCount >= kTraceSlots) {
+    g_traceCount = 0;
+  }
+
+  Preferences preferences;
+  if (!preferences.begin("trace", false)) {
+    return;
+  }
+  char key[16];
+  const int slot = g_traceCount++;
+  std::snprintf(key, sizeof(key), "mx%d", slot);
+  preferences.putInt(key, static_cast<int>(std::lround(raw.x * 10.0F)));
+  std::snprintf(key, sizeof(key), "my%d", slot);
+  preferences.putInt(key, static_cast<int>(std::lround(raw.y * 10.0F)));
+  std::snprintf(key, sizeof(key), "mz%d", slot);
+  preferences.putInt(key, static_cast<int>(std::lround(raw.z * 10.0F)));
+  std::snprintf(key, sizeof(key), "az%d", slot);
+  preferences.putInt(key, static_cast<int>(std::lround(accel.z * 100.0F)));
+  std::snprintf(key, sizeof(key), "yw%d", slot);
+  preferences.putInt(key, yawDeci);
+  std::snprintf(key, sizeof(key), "hd%d", slot);
+  preferences.putInt(key, static_cast<int>(std::lround(headingDegrees * 10.0F)));
+  std::snprintf(key, sizeof(key), "dp%d", slot);
+  preferences.putInt(key, static_cast<int>(std::lround(dispersionDegrees * 10.0F)));
+  std::snprintf(key, sizeof(key), "rj%d", slot);
+  preferences.putInt(key, rejectCode);
+  preferences.putInt("count", g_traceCount);
+  preferences.end();
+}
+
 // 磁気を 1 サンプル取り込む。新しい値が来ていなければ何もしない。
 // yawDeci は loop() が読んだ実際の首の角度。ここで読み直すと UART を
 // 二重に叩くことになるので受け取る。
@@ -235,10 +282,15 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
     return;
   }
 
+  const compass::Vec3 accel = readAccel();
   const compass::Vec3 corrected = compass::applyCalibration(g_calibration, raw);
-  const compass::Attitude attitude = compass::attitudeFromAccel(readAccel());
+  const compass::Attitude attitude = compass::attitudeFromAccel(accel);
   const float magneticHeading = compass::tiltCompensatedHeadingDegrees(corrected, attitude);
   g_headingFilter.update(magneticHeading);
+
+  // 首が正面にある間の生データを貯める。ホストで同じ計算を再現するため。
+  appendTrace(raw, accel, yawDeci, magneticHeading, g_headingFilter.dispersionDegrees(),
+              static_cast<int>(g_state.lastReject));
 
   g_gate.learnReferenceField(compass::magnitude(raw));
 }
@@ -267,6 +319,13 @@ void saveLiveState(int actualYaw) {
                      static_cast<int>(std::lround(g_headingFilter.valueDegrees() * 10.0F)));
   preferences.putInt("trueHdg", static_cast<int>(std::lround(g_bodyTrueHeading * 10.0F)));
   preferences.putInt("cmdYaw", g_commandedYaw);
+  // ゲートが何で弾いているかを、採用/棄却にかかわらず毎回残す。
+  // appendTrace は姿勢が綺麗なときしか呼ばれないので、棄却理由が見えない。
+  preferences.putInt("gateRej", static_cast<int>(g_lastGateReject));
+  preferences.putInt("filtN", g_headingFilter.hasValue() ? 1 : 0);
+  preferences.putInt("disp",
+                     static_cast<int>(std::lround(g_headingFilter.dispersionDegrees() * 10.0F)));
+  preferences.putInt("sinceStop", static_cast<int>(millis() - g_lastServoStopMillis));
   // 指令値と実際の角度がずれていないかを見る。ゲートは指令値を信じて
   // 「測定姿勢かどうか」を判断しているので、ここがずれていると前提が崩れる。
   preferences.putInt("realYaw", actualYaw);
@@ -392,11 +451,19 @@ void loop() {
   gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
   gateInput.yawDeciDegrees = actualYaw;
 
-  if (!gateInput.servoMoving) {
-    g_lastServoStopMillis = g_lastServoCommandMillis + g_config.servoSettleMillis;
+  // 停止した瞬間を 1 回だけ記録する。
+  //
+  // Why not 毎周期 lastCommand + settle で上書きする: ゲートはこの時刻から
+  // さらに settleMillis 経つまで Settling を返す。毎周期書き換えると基準が
+  // 動き続けて、首が止まっていても永久に Settling のままになる (実機で発生)。
+  static bool wasMoving = false;
+  if (wasMoving && !gateInput.servoMoving) {
+    g_lastServoStopMillis = now;
   }
+  wasMoving = gateInput.servoMoving;
 
   const compass::MeasurementGate::Reject reject = g_gate.evaluate(gateInput);
+  g_lastGateReject = reject;
   // フィルタが空 (= 測定姿勢での有効なサンプルをまだ 1 つも取れていない) なら、
   // ゲートを通っていても採用できない。
   const bool accepted =
