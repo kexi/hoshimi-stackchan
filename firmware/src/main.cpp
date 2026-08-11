@@ -20,12 +20,15 @@
 #include "compass/calibration.hpp"
 #include "compass/declination.hpp"
 #include "compass/heading.hpp"
+#include "compass/level_calibration.hpp"
 #include "compass/sphere_fit.hpp"
 #include "compass/stability.hpp"
 #include "location_config.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -51,13 +54,13 @@ constexpr std::uint32_t kWifiTimeoutMillis = 20000;
 // 6 割になり、方位が全方位に散らばった。最小二乗なら球面の一部さえ掃ければ
 // 中心が求まるので、短い回転で済む。
 constexpr std::size_t kCalibrationCapacity = 512;
-constexpr std::size_t kMinCalibrationSamples = 120;
-constexpr float kMinFieldRadiusMicroTesla = 20.0F;
+constexpr std::size_t kMinCalibrationSamples = 24;
+constexpr float kMinFieldRadiusMicroTesla = 12.0F;
 // 補正後に球へどれだけ乗っていれば採用するか。実機のハードアイアンは地磁気の
 // 6 倍あり歪みが強いので、厳しくしすぎると永久に採用されない。
 constexpr float kMaxCalibrationResidual = 0.25F;
 // 当てはめは数百点の最小二乗で重い。毎周期回すとウォッチドッグを踏む。
-constexpr std::uint32_t kFitIntervalMillis = 2000;
+constexpr std::uint32_t kFitIntervalMillis = 700;
 
 app::State g_state;
 app::Config g_config;
@@ -66,6 +69,12 @@ astro::Observer g_observer;
 compass::MagCalibration g_calibration;
 // 3x3 のソフトアイアン補正。実機の歪みは対角では直せず、方位が 32 度ずれた。
 compass::EllipsoidFit g_ellipsoid;
+// 水平回転で取る補正。この機体は本体に強い磁石があり、傾けると磁石も一緒に
+// 動くので 8 の字回しでは地磁気の球にならない (実機で半径 169uT = 地磁気の
+// 3.7 倍になった)。首を固定して本体だけ水平に回せば相対関係が保たれる。
+compass::LevelCalibration g_level;
+// 直近の当てはめの被覆率。描画から読むだけにして、当てはめは間隔を空けて回す。
+float g_calibrationCoverage = 0.0F;
 compass::MeasurementGate g_gate;
 compass::HeadingFilter g_headingFilter{0.5F};
 
@@ -142,6 +151,28 @@ void saveEllipsoid(const compass::EllipsoidFit& fit) {
     return;
   }
   preferences.putBytes("fit", &fit, sizeof(fit));
+  preferences.end();
+}
+
+void saveLevel(const compass::LevelCalibration& calibration) {
+  Preferences preferences;
+  if (!preferences.begin("level", false)) {
+    return;
+  }
+  preferences.putBytes("cal", &calibration, sizeof(calibration));
+  preferences.end();
+}
+
+void loadLevel() {
+  Preferences preferences;
+  if (!preferences.begin("level", true)) {
+    return;
+  }
+  compass::LevelCalibration stored;
+  if (preferences.getBytesLength("cal") == sizeof(stored)) {
+    preferences.getBytes("cal", &stored, sizeof(stored));
+    g_level = stored;
+  }
   preferences.end();
 }
 
@@ -280,7 +311,26 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
 
   const compass::Vec3 raw = readMag();
   if (g_state.phase == app::Phase::Calibrating) {
-    if (g_calibrationSamples != nullptr && g_calibrationCount < kCalibrationCapacity) {
+    // 姿勢が変わっていないサンプルだけを採る。
+    //
+    // Why not 水平 (accel.z がほぼ 1g) を要求する: スタックチャンの CoreS3 は
+    // 顔として見やすいよう筐体が傾いており、実機では accel.z = 0.61g
+    // (約 52 度傾き) で固定されていた。水平を要求すると 1 点も採れない。
+    //
+    // 大事なのは絶対的な水平ではなく、回している間に姿勢が変わらないこと。
+    // 傾きが一定なら、磁石との相対関係も一定に保たれ、円が描ける。
+    const compass::Vec3 accel = readAccel();
+    static float referenceTilt = -1.0F;
+    const float tilt = accel.z / std::max(0.001F, compass::magnitude(accel));
+    if (referenceTilt < -0.5F) {
+      referenceTilt = tilt;
+    }
+    // 姿勢の許容を狭くする。実機では 5 度の揺れでも、補正後の半径が
+    // 2〜22uT に散らばって方位誤差 23 度になった。回転面がぶれると
+    // 断面の半径が変わるため、傾きに対する感度が高い。
+    const bool attitudeHeld = std::fabs(tilt - referenceTilt) < 0.02F; // 約 1 度
+    if (attitudeHeld && g_calibrationSamples != nullptr &&
+        g_calibrationCount < kCalibrationCapacity) {
       g_calibrationSamples[g_calibrationCount++] = raw;
     }
     return;
@@ -302,36 +352,39 @@ void updateHeading(int yawDeci, std::uint32_t nowMillis) {
 
 // キャリブレーションの完了判定。当てはめが重いので間隔を空けて呼ぶこと。
 void tryFinishCalibration() {
-  const compass::EllipsoidFit fit = compass::fitEllipsoid(g_calibrationSamples, g_calibrationCount);
-  if (!fit.valid || fit.meanRadius <= kMinFieldRadiusMicroTesla) {
+  const compass::LevelCalibration calibration =
+      compass::fitLevelCircle(g_calibrationSamples, g_calibrationCount);
+  g_calibrationCoverage = calibration.valid
+                              ? 1.0F
+                              : compass::angularCoverage(g_calibrationSamples, g_calibrationCount,
+                                                         calibration.offsetX, calibration.offsetY);
+  if (!calibration.valid || calibration.radius < kMinFieldRadiusMicroTesla) {
     return;
   }
-  if (fit.normalizedResidual >= kMaxCalibrationResidual) {
+  if (calibration.normalizedResidual >= kMaxCalibrationResidual) {
     return;
   }
 
-  g_ellipsoid = fit;
-  saveEllipsoid(fit);
-
-  // 対角側も埋めておく。3x3 が使えない経路 (古い保存など) の保険。
-  const compass::SphereFit sphere = compass::fitSphere(g_calibrationSamples, g_calibrationCount);
-  const compass::MagCalibration calibration =
-      compass::calibrationFromSphere(sphere, g_calibrationSamples, g_calibrationCount);
-  if (calibration.valid) {
-    g_calibration = calibration;
-    saveCalibration(calibration);
-  }
+  g_level = calibration;
+  saveLevel(calibration);
   g_headingFilter.reset();
 }
 
+// 直近の当てはめ結果。描画から使う。
+// 描画のたびに当てはめを回すとウォッチドッグを踏むので、
+// tryFinishCalibration() が更新した値を読むだけにする。
 void drawCalibrating() {
   auto& display = M5.Display;
-  const int percent = static_cast<int>(g_calibrationCount * 100 / kMinCalibrationSamples);
   display.setTextColor(TFT_YELLOW, TFT_BLACK);
   display.setCursor(4, 40);
-  display.print("turn all ways    ");
+  display.print("spin in place ");
   display.setCursor(4, 76);
-  display.printf("%d%%      ", percent > 100 ? 100 : percent);
+  display.printf("%d%%      ", static_cast<int>(g_calibrationCoverage * 100.0F));
+
+  // 姿勢が変わると採れないので、その場で伝える。
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(4, 112);
+  display.printf("n=%d      ", static_cast<int>(g_calibrationCount));
 }
 
 void drawStatus() {
@@ -411,10 +464,10 @@ void setup() {
       static_cast<compass::Vec3*>(ps_malloc(kCalibrationCapacity * sizeof(compass::Vec3)));
 
   loadCalibration();
-  loadEllipsoid();
+  loadLevel();
   syncTime();
 
-  if (!g_ellipsoid.valid) {
+  if (!g_level.valid) {
     g_state.phase = app::Phase::Calibrating;
     g_calibrationCount = 0;
   }
@@ -468,7 +521,7 @@ void loop() {
   tick.nowMillis = now;
   tick.unixSeconds = static_cast<std::int64_t>(std::time(nullptr));
   tick.timeValid = g_timeValid;
-  tick.calibrationValid = g_ellipsoid.valid;
+  tick.calibrationValid = g_level.valid;
   tick.input = readInput();
   tick.bodyTrueHeadingDegrees = g_bodyTrueHeading;
   tick.headingValid = g_headingValid;
@@ -489,16 +542,46 @@ void loop() {
     Preferences probe;
     if (probe.begin("probe", false)) {
       probe.putInt("calN", static_cast<int>(g_calibrationCount));
-      // 当てはめが採用されない理由を数値で見る。30 秒に 1 回だけなので軽い。
+      // 水平補正の採否。read_nvs.py はスカラーしか読まないので blob とは別に置く。
+      probe.putInt("lvOk", g_level.valid ? 1 : 0);
+      probe.putInt("lvR", static_cast<int>(std::lround(g_level.radius * 10.0F)));
+      probe.putInt("lvRes", static_cast<int>(std::lround(g_level.normalizedResidual * 1000.0F)));
+      probe.putInt("lvCov", static_cast<int>(std::lround(g_calibrationCoverage * 100.0F)));
+      // 傾き判定に使っている値。閾値が実機に対して妥当かを見る。
+      const compass::Vec3 accelProbe = readAccel();
+      probe.putInt("accZ", static_cast<int>(std::lround(accelProbe.z * 1000.0F)));
+      probe.putInt("accMag",
+                   static_cast<int>(std::lround(compass::magnitude(accelProbe) * 1000.0F)));
+      // その場で当てはめて、採用されない理由を見る。
+      const compass::LevelCalibration probeFit =
+          compass::fitLevelCircle(g_calibrationSamples, g_calibrationCount);
+      probe.putInt("pfOk", probeFit.valid ? 1 : 0);
+      probe.putInt("pfR", static_cast<int>(std::lround(probeFit.radius * 10.0F)));
+      probe.putInt("pfRes", static_cast<int>(std::lround(probeFit.normalizedResidual * 1000.0F)));
+      // 3x3 補正の採否を数値で見る。30 秒に 1 回だけなので軽い。
+      probe.putInt("ellOk", g_ellipsoid.valid ? 1 : 0);
+      probe.putInt("ellR", static_cast<int>(std::lround(g_ellipsoid.meanRadius * 10.0F)));
+      probe.putInt("ellRes",
+                   static_cast<int>(std::lround(g_ellipsoid.normalizedResidual * 1000.0F)));
+      // その場で当てはめて、なぜ採用されないかを見る。
       if (g_calibrationCount >= kMinCalibrationSamples) {
-        const compass::SphereFit fit = compass::fitSphere(g_calibrationSamples, g_calibrationCount);
-        probe.putInt("fitR", static_cast<int>(std::lround(fit.radius * 10.0F)));
-        const compass::MagCalibration candidate =
-            compass::calibrationFromSphere(fit, g_calibrationSamples, g_calibrationCount);
-        probe.putInt("res", static_cast<int>(std::lround(
-                                compass::residualAfterCalibration(candidate, g_calibrationSamples,
-                                                                  g_calibrationCount) *
-                                1000.0F)));
+        const compass::EllipsoidFit probeFit =
+            compass::fitEllipsoid(g_calibrationSamples, g_calibrationCount);
+        probe.putInt("pfOk", probeFit.valid ? 1 : 0);
+        probe.putInt("pfR", static_cast<int>(std::lround(probeFit.meanRadius * 10.0F)));
+        probe.putInt("pfRes", static_cast<int>(std::lround(probeFit.normalizedResidual * 1000.0F)));
+        // 解けない原因を追うため、実機の生データを 32 点だけ持ち出す。
+        // ホストで同じ入力を食わせて再現する。
+        for (int slot = 0; slot < 32; ++slot) {
+          const std::size_t source = (g_calibrationCount / 32) * static_cast<std::size_t>(slot);
+          char key[8];
+          std::snprintf(key, sizeof(key), "p%dx", slot);
+          probe.putInt(key, static_cast<int>(std::lround(g_calibrationSamples[source].x * 10.0F)));
+          std::snprintf(key, sizeof(key), "p%dy", slot);
+          probe.putInt(key, static_cast<int>(std::lround(g_calibrationSamples[source].y * 10.0F)));
+          std::snprintf(key, sizeof(key), "p%dz", slot);
+          probe.putInt(key, static_cast<int>(std::lround(g_calibrationSamples[source].z * 10.0F)));
+        }
       }
       probe.end();
     }
