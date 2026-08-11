@@ -242,7 +242,12 @@ bool servoLikelyMoving(std::uint32_t nowMillis, int actualYaw) {
   static int lastYaw = 0;
   static std::uint32_t lastChangeMillis = 0;
 
-  constexpr int kMovementThresholdDeci = 5;
+  // 保持中の微振動を「動いている」と誤判定しない幅。
+  //
+  // Why not 5 (0.5 度): サーボは臨界減衰で目標へ漸近するので、静止して見えても
+  // 数度の範囲で揺れ続ける。実測の静定精度は 8.7 度あった。0.5 度で判定すると
+  // 永久に動作中と見なされ、磁気が一切採用されない (実機で発生)。
+  constexpr int kMovementThresholdDeci = 30;
   if (std::abs(actualYaw - lastYaw) > kMovementThresholdDeci) {
     lastYaw = actualYaw;
     lastChangeMillis = nowMillis;
@@ -285,7 +290,19 @@ void applyServoIntent(const app::ServoIntent& intent, int actualYaw) {
   const bool phaseChanged = g_state.phase != lastPhase;
   lastPhase = g_state.phase;
 
-  if (intent.shouldMove || phaseChanged) {
+  // 首がまだ目標に着いていないなら、局面が続いていても指令を出し直す。
+  //
+  // Why not 局面が変わった瞬間だけ出す: 局面は出たり入ったりを繰り返す。
+  // 実機では ReturningToMeasurePose → Measuring → (姿勢で棄却) → Idle →
+  // ReturningToMeasurePose と 34ms 周期で回り、指令が首に届く前に局面が
+  // 変わって、首が -98 度に取り残されたままになった。
+  //
+  // commandServo() 側が「到達済みかつ同じ指令なら何もしない」ので、
+  // 無駄な再発行にはならない。
+  const bool notThereYet =
+      std::abs(actualYaw - intent.yawDeciDegrees) > compass::kMeasurementYawToleranceDeci;
+
+  if (intent.shouldMove || phaseChanged || notThereYet) {
     commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees, actualYaw);
   }
 }
