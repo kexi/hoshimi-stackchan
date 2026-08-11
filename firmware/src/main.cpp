@@ -7,9 +7,12 @@
 // ずれることを実機で確認しているため (段階 8)。ロジックは app_core 側にあり、
 // ここは実機の入出力を state machine に橋渡しするだけ。
 //
-// 診断用の NVS 書き込みは意図的に置いていない。デバッグのために毎周期
-// フラッシュへ書き、球の当てはめを回していたところ、それ自体がウォッチドッグを
-// 踏んで 4 秒ごとに再起動していた。状態は画面に出せば足りる。
+// 状態はシリアルへ出す (just watch / just verify で読む)。
+//
+// Why not NVS: フラッシュの読み出しは esptool のリセットを伴うので、何度読んでも
+// 「起動直後」の値しか取れず、指した結果が観測できない。NVS には節目の値だけを
+// 30 秒間隔で残す。毎周期フラッシュへ書き、そこで球の当てはめまで回していた頃は、
+// それ自体がウォッチドッグを踏んで数秒ごとに再起動していた。
 
 #include <M5StackChan.h>
 #include <M5Unified.h>
@@ -61,6 +64,10 @@ constexpr float kMinFieldRadiusMicroTesla = 12.0F;
 constexpr float kMaxCalibrationResidual = 0.25F;
 // 当てはめは数百点の最小二乗で重い。毎周期回すとウォッチドッグを踏む。
 constexpr std::uint32_t kFitIntervalMillis = 700;
+// 状態をシリアルへ出す間隔。局面の遷移が追える程度に細かくする。
+// NVS への書き込みはこれより間引く (フラッシュの摩耗を避けるため)。
+constexpr std::uint32_t kProbeIntervalMillis = 500;
+constexpr std::uint32_t kNvsProbeIntervalMillis = 30000;
 
 app::State g_state;
 app::Config g_config;
@@ -79,6 +86,11 @@ float g_calibrationCoverage = 0.0F;
 float g_referenceTilt = 0.0F;
 // タッチ入力を受けた回数。実機でスワイプが検出されているかを見る。
 int g_touchEventCount = 0;
+// 3 ゾーンの強度を 1 つの整数に畳んだもの (前*100 + 中*10 + 後)。
+// ジェスチャにならなくても、触れていること自体は分かる。
+int g_touchIntensity = 0;
+// 触れられていた周期の数。触っても 0 のままならセンサまで届いていない。
+int g_touchSeenCount = 0;
 // 直近の tick で サーボが静止していたか。診断用。
 bool g_lastTickServoSettled = false;
 compass::MeasurementGate g_gate;
@@ -382,6 +394,16 @@ void applyServoIntent(const app::ServoIntent& intent, int actualYaw) {
 }
 
 app::Input readInput() {
+  // 触れられているかどうかを、ジェスチャ判定とは別に記録する。
+  // スワイプが効かないとき、センサに届いていないのか、ジェスチャとして
+  // 認識されていないのかを切り分けるため。
+  const auto& intensities = M5StackChan.TouchSensor.getIntensities();
+  g_touchIntensity = static_cast<int>(intensities[0]) * 100 +
+                     static_cast<int>(intensities[1]) * 10 + static_cast<int>(intensities[2]);
+  if (g_touchIntensity != 0) {
+    g_touchSeenCount++;
+  }
+
   if (M5StackChan.TouchSensor.wasSwipedForward()) {
     ++g_touchEventCount;
     return app::Input::SwipeForward;
@@ -608,6 +630,9 @@ void drawStatus() {
 void setup() {
   auto config = M5.config();
   M5.begin(config);
+  // 動作中の状態を読む唯一の手段。NVS はフラッシュ読み出しに esptool のリセットを
+  // 伴うので、何度読んでも「起動直後」しか観測できず、指した結果が見えない。
+  Serial.begin(115200);
   M5.Display.setRotation(1);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.setTextSize(2);
@@ -623,7 +648,16 @@ void setup() {
   // CoreS3 は 8MB の PSRAM を積んでいるので、サンプルを全点保持できる。
   g_calibrationSamples =
       static_cast<compass::Vec3*>(ps_malloc(kCalibrationCapacity * sizeof(compass::Vec3)));
+  if (g_calibrationSamples == nullptr) {
+    // PSRAM が取れないままキャリブレーションに入ると null を辿って落ちる。
+    // 内部 RAM へ落として、点数を削ってでも動かす。
+    g_calibrationSamples =
+        static_cast<compass::Vec3*>(malloc(kCalibrationCapacity * sizeof(compass::Vec3)));
+  }
 
+  // タッチセンサ (Si12T, 0x68) が I2C に居るかを起動時に一度確かめる。
+  // 実機でスワイプが 1 度も検出されなかったので、ジェスチャ判定の問題なのか
+  // センサまで届いていないのかを切り分ける。
   loadCalibration();
   loadLevel();
   syncTime();
@@ -696,31 +730,41 @@ void loop() {
   applyServoIntent(app::servoIntentFor(g_state), actualYaw);
 
   // 進捗をホストから確認するための最小限の記録。
-  // 診断のために毎周期フラッシュへ書いていたら 4 秒ごとに再起動した。
-  // 30 秒に 1 回、値 1 つだけに留める。
+  //
+  // Why not ここで当てはめ直す: 段階 8 では採用されない理由を追うために
+  // fitLevelCircle と fitEllipsoid をこの場で回し、生サンプル 96 個も書いていた。
+  // 512 点の最小二乗と固有値分解を NVS 書き込みと同じ周期で回すと 1 回が長すぎて
+  // ウォッチドッグを踏み、起動 0.5 秒後に再起動し続けた。当てはめの結果は
+  // すでに変数にあるので、読むだけにする。
   static std::uint32_t lastProbeMillis = 0;
-  if (now - lastProbeMillis >= 30000) {
+  if (now - lastProbeMillis >= kProbeIntervalMillis) {
     lastProbeMillis = now;
+    // 首が実際に指している方位 = 機体の向き + 首の相対角。
+    // 目標を指せているかを、目視でなく数値で検証する。
+    //
+    // 機体の向きは state 側の採用済みの値を使う。g_bodyTrueHeading は首を振ると
+    // 更新が止まるので、指した直後の検証に使うと古い値が混ざる。
+    const int yawDeci = currentYawDeci(now);
+    const float neckAbsolute = g_state.bodyHeadingDegrees + static_cast<float>(yawDeci) / 10.0F;
+
+    // NVS はフラッシュなので、シリアルと同じ頻度で書くと摩耗する。
+    static std::uint32_t lastNvsMillis = 0;
     Preferences probe;
-    if (probe.begin("probe", false)) {
+    const bool shouldWriteNvs = now - lastNvsMillis >= kNvsProbeIntervalMillis;
+    if (shouldWriteNvs && probe.begin("probe", false)) {
+      lastNvsMillis = now;
       probe.putInt("calN", static_cast<int>(g_calibrationCount));
       // 水平補正の採否。read_nvs.py はスカラーしか読まないので blob とは別に置く。
       probe.putInt("lvOk", g_level.valid ? 1 : 0);
-      probe.putInt("lvR", static_cast<int>(std::lround(g_level.radius * 10.0F)));
-      probe.putInt("lvRes", static_cast<int>(std::lround(g_level.normalizedResidual * 1000.0F)));
+      probe.putInt("lvCov", static_cast<int>(std::lround(g_calibrationCoverage * 100.0F)));
       probe.putInt("hdgOk", g_headingValid ? 1 : 0);
       probe.putInt("hdg", static_cast<int>(std::lround(g_bodyTrueHeading * 10.0F)));
       probe.putInt("phase", static_cast<int>(g_state.phase));
-      probe.putInt("yaw", currentYawDeci(millis()));
       probe.putInt("rej", static_cast<int>(g_state.lastReject));
-      probe.putInt("nS", static_cast<int>(g_headingFilter.sampleCount()));
       // Pointing に入ってからの経過。抜けない理由の切り分け用。
-      probe.putInt("inPhase", static_cast<int>(millis() - g_state.phaseEnteredMillis));
+      probe.putInt("inPhase", static_cast<int>(now - g_state.phaseEnteredMillis));
       probe.putInt("settled", g_lastTickServoSettled ? 1 : 0);
-      // 首が実際に指している方位 = 機体の向き + 首の相対角。
-      // 真北を指せているかを、目視でなく数値で検証する。
-      const float neckAbsolute =
-          g_bodyTrueHeading + static_cast<float>(currentYawDeci(millis())) / 10.0F;
+      probe.putInt("yaw", yawDeci);
       probe.putInt("neckAbs", static_cast<int>(std::lround(neckAbsolute * 10.0F)));
       probe.putInt("tgtAz", static_cast<int>(std::lround(
                                 g_state.lastPosition.horizontal.azimuthDegrees * 10.0F)));
@@ -729,45 +773,25 @@ void loop() {
       probe.putInt("target", static_cast<int>(g_state.target));
       // タッチ入力が届いているか。スワイプが効かないときの切り分け用。
       probe.putInt("touchN", g_touchEventCount);
-      probe.putInt("lvCov", static_cast<int>(std::lround(g_calibrationCoverage * 100.0F)));
-      // 傾き判定に使っている値。閾値が実機に対して妥当かを見る。
-      const compass::Vec3 accelProbe = readAccel();
-      probe.putInt("accZ", static_cast<int>(std::lround(accelProbe.z * 1000.0F)));
-      probe.putInt("accMag",
-                   static_cast<int>(std::lround(compass::magnitude(accelProbe) * 1000.0F)));
-      // その場で当てはめて、採用されない理由を見る。
-      const compass::LevelCalibration probeFit =
-          compass::fitLevelCircle(g_calibrationSamples, g_calibrationCount);
-      probe.putInt("pfOk", probeFit.valid ? 1 : 0);
-      probe.putInt("pfR", static_cast<int>(std::lround(probeFit.radius * 10.0F)));
-      probe.putInt("pfRes", static_cast<int>(std::lround(probeFit.normalizedResidual * 1000.0F)));
-      // 3x3 補正の採否を数値で見る。30 秒に 1 回だけなので軽い。
-      probe.putInt("ellOk", g_ellipsoid.valid ? 1 : 0);
-      probe.putInt("ellR", static_cast<int>(std::lround(g_ellipsoid.meanRadius * 10.0F)));
-      probe.putInt("ellRes",
-                   static_cast<int>(std::lround(g_ellipsoid.normalizedResidual * 1000.0F)));
-      // その場で当てはめて、なぜ採用されないかを見る。
-      if (g_calibrationCount >= kMinCalibrationSamples) {
-        const compass::EllipsoidFit probeFit =
-            compass::fitEllipsoid(g_calibrationSamples, g_calibrationCount);
-        probe.putInt("pfOk", probeFit.valid ? 1 : 0);
-        probe.putInt("pfR", static_cast<int>(std::lround(probeFit.meanRadius * 10.0F)));
-        probe.putInt("pfRes", static_cast<int>(std::lround(probeFit.normalizedResidual * 1000.0F)));
-        // 解けない原因を追うため、実機の生データを 32 点だけ持ち出す。
-        // ホストで同じ入力を食わせて再現する。
-        for (int slot = 0; slot < 32; ++slot) {
-          const std::size_t source = (g_calibrationCount / 32) * static_cast<std::size_t>(slot);
-          char key[8];
-          std::snprintf(key, sizeof(key), "p%dx", slot);
-          probe.putInt(key, static_cast<int>(std::lround(g_calibrationSamples[source].x * 10.0F)));
-          std::snprintf(key, sizeof(key), "p%dy", slot);
-          probe.putInt(key, static_cast<int>(std::lround(g_calibrationSamples[source].y * 10.0F)));
-          std::snprintf(key, sizeof(key), "p%dz", slot);
-          probe.putInt(key, static_cast<int>(std::lround(g_calibrationSamples[source].z * 10.0F)));
-        }
-      }
       probe.end();
     }
+
+    // 同じ内容をシリアルへも出す。NVS は起動直後しか読めないので、
+    // 動いている最中の検証はこちらを使う。
+    //
+    // nS と settled は「rej=0 なのに hdgOk=0」を切り分けるために要る。
+    // ゲートを通っていても、フィルタが溜まっていなければ方位は確定しない。
+    Serial.printf("phase=%s target=%d rej=%d hdgOk=%d hdg=%.1f yaw=%d neckAbs=%.1f "
+                  "tgtAz=%.1f alt=%.1f timeOk=%d touchN=%d calN=%u nS=%u settled=%d "
+                  "tI=%03d tSeen=%d\n",
+                  app::phaseName(g_state.phase), static_cast<int>(g_state.target),
+                  static_cast<int>(g_state.lastReject), g_headingValid ? 1 : 0,
+                  static_cast<double>(g_bodyTrueHeading), yawDeci,
+                  static_cast<double>(neckAbsolute), g_state.lastPosition.horizontal.azimuthDegrees,
+                  g_state.lastPosition.horizontal.altitudeDegrees, g_timeValid ? 1 : 0,
+                  g_touchEventCount, static_cast<unsigned>(g_calibrationCount),
+                  static_cast<unsigned>(g_headingFilter.sampleCount()),
+                  g_lastTickServoSettled ? 1 : 0, g_touchIntensity, g_touchSeenCount);
   }
 
   static std::uint32_t lastDraw = 0;

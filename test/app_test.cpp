@@ -182,10 +182,33 @@ void testClickTogglesAutoCycle() {
   CHECK_TRUE(!state.autoCycleEnabled);
 }
 
-void testTrackingEscapesWhenHeadingLost() {
-  // 方位が無いまま Tracking に入ったら、周期を待たずに測り直しへ戻ること。
+void testTrackingStaysWhileNeckIsAway() {
+  // 首を振っている間に方位が測れなくなっても、追尾に留まり続けること。
   //
-  // 方位が無効だと解が作れず、首も動かない。首が動かないので機体の動きも
+  // 指すために首を振ると磁場が乱れてその場では測れないが、機体は動いて
+  // いないので方位そのものは変わらない。ここで測り直しに戻ると、首を正面へ
+  // 戻し、また指しに行き、また戻る往復に陥る (実機で発生)。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+  CHECK_TRUE(state.hasHeading);
+
+  clock += 200;
+  app::Tick neckAway = healthyTick(clock);
+  neckAway.headingValid = false;
+  neckAway.measurementAccepted = false;
+  app::step(state, neckAway, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::Tracking);
+  // 採用済みの方位で解き続けること
+  CHECK_TRUE(state.hasSolve);
+}
+
+void testTrackingEscapesWhenHeadingWasNeverTaken() {
+  // 方位を一度も採れていないまま Tracking に居たら、測り直しへ戻ること。
+  //
+  // 方位が無いと解が作れず、首も動かない。首が動かないので機体の動きも
   // 検出されず、再測定の周期が来るまで固まる。実機では首が -48 度のまま
   // Tracking に留まり続けた。
   app::State state;
@@ -194,10 +217,11 @@ void testTrackingEscapesWhenHeadingLost() {
   advanceUntil(state, app::Phase::Tracking, clock, config);
   CHECK_TRUE(state.phase == app::Phase::Tracking);
 
+  // 方位を持っていない状態を作る
+  state.hasHeading = false;
+
   clock += 200;
-  app::Tick lost = healthyTick(clock);
-  lost.headingValid = false;
-  app::step(state, lost, config, tokyoObserver());
+  app::step(state, healthyTick(clock), config, tokyoObserver());
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 }
 
@@ -365,7 +389,8 @@ int main() {
   testMeasurementTimeoutWithoutHeading();
   testSwipeChangesTarget();
   testClickTogglesAutoCycle();
-  testTrackingEscapesWhenHeadingLost();
+  testTrackingStaysWhileNeckIsAway();
+  testTrackingEscapesWhenHeadingWasNeverTaken();
   testBodyMovementTriggersRemeasure();
   testMillisWrapDoesNotBreakTransitions();
   testTrackingUpdatesAsSkyMoves();

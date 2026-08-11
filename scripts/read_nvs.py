@@ -47,12 +47,19 @@ SCALAR_FORMATS = {
 
 
 def read_flash(port, esptool_path, destination):
+    # --before no-reset / --after no-reset を付けないと、esptool が読み出しの前後で
+    # デバイスをリセットする。そうすると毎回「起動直後」の NVS しか読めず、
+    # 動いている最中の状態が取れない (実際に inPhase が常に 468ms で張り付いた)。
     subprocess.run(
         [
             sys.executable,
             esptool_path,
             "--port",
             port,
+            "--before",
+            "no-reset",
+            "--after",
+            "no-reset",
             "read-flash",
             hex(NVS_OFFSET),
             hex(NVS_SIZE),

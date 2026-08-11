@@ -6,3 +6,7 @@ compile_commands.json
 firmware/sdkconfig.*
 firmware/src/wifi_config.h
 .DS_Store
+
+# scripts が互いを import すると生成される
+__pycache__/
+*.pyc

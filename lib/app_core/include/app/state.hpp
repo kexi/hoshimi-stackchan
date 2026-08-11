@@ -91,6 +91,15 @@ struct State {
   pointing::SolveResult lastSolve;
   bool hasSolve = false;
 
+  // 直近に採用した機体の方位。Measuring で確定させ、機体が動くまで持ち続ける。
+  //
+  // Why not tick.headingValid をそのまま使う: 首を動かすと磁場が乱れて方位は
+  // 測れなくなるが、機体は動いていないので方位自体は変わっていない。実機では
+  // 指すために首を振った瞬間に headingValid が落ち、それを「方位を失った」と
+  // 解釈して測定に戻り、また指しては戻るのを繰り返した。
+  float bodyHeadingDegrees = 0.0F;
+  bool hasHeading = false;
+
   compass::MeasurementGate::Reject lastReject = compass::MeasurementGate::Reject::None;
 };
 

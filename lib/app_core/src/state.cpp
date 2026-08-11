@@ -25,7 +25,9 @@ void solveForTarget(State& state, const Tick& tick, const astro::Observer& obser
   pointing::SolveInput input;
   input.targetAzimuthDegrees = state.lastPosition.horizontal.azimuthDegrees;
   input.targetAltitudeDegrees = state.lastPosition.horizontal.altitudeDegrees;
-  input.bodyHeadingDegrees = tick.bodyTrueHeadingDegrees;
+  // 採用済みの方位を使う。首を振っている間 tick 側は無効になるが、機体は
+  // 動いていないので方位は変わらない。
+  input.bodyHeadingDegrees = state.bodyHeadingDegrees;
   if (state.hasSolve) {
     input.currentYawDeciDegrees = state.lastSolve.command.yawDeciDegrees;
     input.currentPitchDeciDegrees = state.lastSolve.command.pitchDeciDegrees;
@@ -178,6 +180,8 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
 
   case Phase::Measuring: {
     if (tick.measurementAccepted && tick.headingValid) {
+      state.bodyHeadingDegrees = tick.bodyTrueHeadingDegrees;
+      state.hasHeading = true;
       state.lastMeasureMillis = tick.nowMillis;
       solveForTarget(state, tick, observer);
       enterPhase(state, Phase::Pointing, tick.nowMillis);
@@ -188,7 +192,7 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     if (timedOut) {
       // 測れなくても、以前の方位があるなら指しに行く。
       // 何も出さずに固まるより、古い情報でも動いている方が状態が読める。
-      if (tick.headingValid) {
+      if (state.hasHeading) {
         solveForTarget(state, tick, observer);
         enterPhase(state, Phase::Pointing, tick.nowMillis);
         return;
@@ -213,13 +217,16 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
   }
 
   case Phase::Tracking: {
-    // 方位が無いまま追尾に入っていたら、すぐ測り直しへ戻る。
+    // 方位を一度も採れていないなら、すぐ測り直しへ戻る。
     //
-    // Why not 再測定の周期を待つ: 方位が無効だと solveForTarget が解を作れず、
-    // servoIntentFor も shouldMove を返さない。首が動かないので機体の動きも
-    // 検出されず、周期が来るまで何もしないまま固まる。実機では首が -48 度の
-    // まま Tracking に留まり続けた。
-    if (!tick.headingValid) {
+    // Why not tick.headingValid を見る: 指すために首を振ると磁場が乱れて
+    // その場では測れなくなるが、機体は動いていないので方位は変わらない。
+    // tick 側を条件にすると、指した瞬間に「方位を失った」と判断して測定へ戻り、
+    // 首を正面に戻し、また指しに行く往復に陥る (実機で発生)。
+    //
+    // Why not 何も見ない: 方位が一度も無いと solveForTarget が解を作れず、
+    // 首が動かないので機体の動きも検出されず、周期が来るまで固まる。
+    if (!state.hasHeading) {
       enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
     }
