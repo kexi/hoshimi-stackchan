@@ -8,18 +8,34 @@ namespace compass {
 
 // 磁気測定を「信じてよい」瞬間だけ通すゲート。
 //
-// BMM150 は本体基板上にあり、サーボは至近距離にある。首を振りながら測ると
-// コイル電流の作る磁場が地磁気 (日本で約 46uT) に乗って方位が破綻する。
-// このゲートがこのプロジェクトの成否を分ける。
+// 実機で測った結果 (段階 8、CoreS3 + M5 公式スタックチャン基板):
+//   - サーボの通電状態による差は |B| で 3.0uT、方位で 2.4 度。
+//     電源 OFF / トルク OFF / トルク ON のどれでもほぼ変わらない。
+//     → 測定のたびにサーボ電源を落とす必要はない
+//   - 首の角度による方位のばらつきは 119 度。これが支配的な誤差要因。
+//     ハードアイアン (地磁気の約 6 倍) が首と一緒に回るため。
+//     → 測定は必ず首を正面 (yaw=0) に戻してから行う。ServoBiasTable より
+//       確実で、実装も単純
+//   - サーボ停止から方位が収まるまでは 300ms
 struct MeasurementGateConfig {
-  // サーボ停止後、磁場が落ち着くまで捨てる時間。実測 (段階 8) で詰める。
+  // サーボ停止後、磁場が落ち着くまで捨てる時間。実測 300ms に余裕を持たせた値。
   std::uint32_t settleMillis = 400;
   // 機体自体が動かされていないことの判定。
   float maxGyroDegPerSec = 3.0F;
-  // 静穏時の |B| からのずれ許容率。保持電流が流れていると |B| がずれる。
+  // 静穏時の |B| からのずれ許容率。実測では通電で 8% しか動かないので、
+  // ここに掛かるのは磁石を近づけられたような明らかな外乱だけ。
   float maxFieldDeviationRatio = 0.25F;
   float maxHeadingDispersionDegrees = 3.0F;
 };
+
+// 磁気を測ってよい首の姿勢。ここから外れた角度で測ると、首と一緒に回る
+// ハードアイアンのせいで最大 119 度ずれる (段階 8 実測)。
+inline constexpr int kMeasurementYawDeci = 0;
+// 正面からこの範囲に入っていれば測ってよい。実測の傾きは 16 ビンで 119 度、
+// つまり 1 ビン (16 度) あたり約 7 度なので、±2 度なら誤差 1 度未満に収まる。
+inline constexpr int kMeasurementYawToleranceDeci = 20;
+
+[[nodiscard]] bool isMeasurementPose(int yawDeciDegrees);
 
 class MeasurementGate {
 public:
@@ -32,6 +48,8 @@ public:
     float gyroMagnitudeDegPerSec = 0.0F;
     float fieldMagnitudeMicroTesla = 0.0F;
     float headingDispersionDegrees = 0.0F;
+    // 測定時の首の角度。正面から外れていると採用しない。
+    int yawDeciDegrees = 0;
   };
 
   enum class Reject : std::uint8_t {
@@ -41,6 +59,8 @@ public:
     DeviceMoving,
     FieldAnomaly,
     Unstable,
+    // 首が正面にない。実測では最大の誤差要因なので最優先で弾く。
+    NotMeasurementPose,
   };
 
   explicit MeasurementGate(MeasurementGateConfig config = {});

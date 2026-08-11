@@ -20,6 +20,11 @@ float angleDifference(float fromDegrees, float toDegrees) {
 
 } // namespace
 
+bool isMeasurementPose(int yawDeciDegrees) {
+  return yawDeciDegrees >= kMeasurementYawDeci - kMeasurementYawToleranceDeci &&
+         yawDeciDegrees <= kMeasurementYawDeci + kMeasurementYawToleranceDeci;
+}
+
 MeasurementGate::MeasurementGate(MeasurementGateConfig config) : config_(config) {}
 
 void MeasurementGate::learnReferenceField(float fieldMagnitudeMicroTesla) {
@@ -45,6 +50,12 @@ void MeasurementGate::resetReferenceField() {
 }
 
 MeasurementGate::Reject MeasurementGate::evaluate(const Input& input) const {
+  // 首が正面にないと最大 119 度ずれる (段階 8 実測)。他のどの要因より大きいので
+  // 最初に見る。
+  if (!isMeasurementPose(input.yawDeciDegrees)) {
+    return Reject::NotMeasurementPose;
+  }
+
   if (input.servoMoving) {
     return Reject::ServoMoving;
   }
@@ -89,6 +100,8 @@ const char* rejectName(MeasurementGate::Reject reject) {
     return "device-moving";
   case MeasurementGate::Reject::FieldAnomaly:
     return "field-anomaly";
+  case MeasurementGate::Reject::NotMeasurementPose:
+    return "not-measurement-pose";
   case MeasurementGate::Reject::Unstable:
     break;
   }

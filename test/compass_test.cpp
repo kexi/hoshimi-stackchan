@@ -247,6 +247,38 @@ void testMeasurementGate() {
   CHECK_TRUE(gate.evaluate(wrapped) == compass::MeasurementGate::Reject::None);
 }
 
+void testMeasurementPoseGate() {
+  // 実機では首の角度による誤差が 119 度に達し、他のどの要因より大きい。
+  // 正面から外れた姿勢での測定は、他の条件が揃っていても弾くこと。
+  compass::MeasurementGate gate;
+
+  compass::MeasurementGate::Input calm;
+  calm.nowMillis = 10000;
+  calm.lastServoStopMillis = 9000;
+  calm.gyroMagnitudeDegPerSec = 0.5F;
+  calm.headingDispersionDegrees = 0.5F;
+  calm.yawDeciDegrees = 0;
+  CHECK_TRUE(gate.accepts(calm));
+
+  // 首が振れていたら、静止していても採用しない
+  compass::MeasurementGate::Input turned = calm;
+  turned.yawDeciDegrees = 900;
+  CHECK_TRUE(gate.evaluate(turned) == compass::MeasurementGate::Reject::NotMeasurementPose);
+
+  // 姿勢の判定は他のどの棄却理由よりも優先される
+  compass::MeasurementGate::Input turnedAndMoving = turned;
+  turnedAndMoving.servoMoving = true;
+  CHECK_TRUE(gate.evaluate(turnedAndMoving) ==
+             compass::MeasurementGate::Reject::NotMeasurementPose);
+
+  // 許容範囲の境界: ±2 度なら通り、それを超えたら弾く
+  CHECK_TRUE(compass::isMeasurementPose(0));
+  CHECK_TRUE(compass::isMeasurementPose(compass::kMeasurementYawToleranceDeci));
+  CHECK_TRUE(compass::isMeasurementPose(-compass::kMeasurementYawToleranceDeci));
+  CHECK_TRUE(!compass::isMeasurementPose(compass::kMeasurementYawToleranceDeci + 1));
+  CHECK_TRUE(!compass::isMeasurementPose(-compass::kMeasurementYawToleranceDeci - 1));
+}
+
 void testServoBiasTable() {
   compass::ServoBiasTable table;
   CHECK_TRUE(!table.isPopulated());
@@ -311,6 +343,7 @@ int main() {
   testAttitudeFromAccel();
   testHeadingFilterIsCircular();
   testMeasurementGate();
+  testMeasurementPoseGate();
   testServoBiasTable();
   testDeclination();
   return testing::summarize("compass");
