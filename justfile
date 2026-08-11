@@ -30,6 +30,23 @@ lint: configure
 build:
     pio run --project-dir firmware
 
+# ホストの時計で実機の RTC を合わせて書き込む。
+# Wi-Fi が無い場所でも天体を指せるようにするため、ビルド時刻を埋め込む。
+set-time:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    port=$(pio device list --json-output \
+      | python3 -c 'import json,sys; print(next((d["port"] for d in json.load(sys.stdin) if "303A:1001" in (d.get("hwid") or "")), ""))')
+    if [ -z "$port" ]; then
+      echo "CoreS3 が見つかりません (hwid 303A:1001)" >&2
+      exit 1
+    fi
+    # 書き込みに約 30 秒かかるぶんを見込んで先の時刻を入れる
+    now=$(python3 -c 'import time; print(int(time.time()) + 35)')
+    PLATFORMIO_BUILD_FLAGS="-DBUILD_UNIX_TIME=${now}" \
+      pio run --project-dir firmware --target upload --upload-port "$port"
+    echo "RTC を $(date -r ${now} '+%Y-%m-%d %H:%M:%S') に合わせました" 
+
 upload port='':
     pio run --project-dir firmware --target upload {{ if port == '' { '' } else { '--upload-port ' + port } }}
 

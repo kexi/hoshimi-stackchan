@@ -193,8 +193,67 @@ void loadEllipsoid() {
   preferences.end();
 }
 
-// Wi-Fi と NTP。失敗しても続行する。真北は時計が無くても指せる。
+// 時刻を用意する。優先順位は RTC → Wi-Fi + NTP。
+//
+// CoreS3 は RTC を積んでいるので、一度合わせれば電源を切っても保たれる。
+// Wi-Fi が無い場所でも天体を指せるようにするため、まず RTC を見る。
 void syncTime() {
+  // ホストのビルド時刻で RTC を合わせる。
+  //
+  // Wi-Fi の無い場所でも天体を指せるようにするための手段。just set-time で
+  // 書き込むと、そのビルドの時刻が RTC に入る。数秒の誤差は天体の方位に
+  // 換算して 0.001 度未満なので、この用途には十分。
+#ifdef BUILD_UNIX_TIME
+  {
+    Preferences stamp;
+    if (stamp.begin("clock", false)) {
+      const int storedBuild = stamp.getInt("build", 0);
+      if (storedBuild != BUILD_UNIX_TIME) {
+        stamp.putInt("build", BUILD_UNIX_TIME);
+        const std::time_t buildTime = BUILD_UNIX_TIME;
+        const std::tm* utc = std::gmtime(&buildTime);
+        if (utc != nullptr) {
+          m5::rtc_datetime_t rtc;
+          rtc.date.year = static_cast<std::uint16_t>(utc->tm_year + 1900);
+          rtc.date.month = static_cast<std::uint8_t>(utc->tm_mon + 1);
+          rtc.date.date = static_cast<std::uint8_t>(utc->tm_mday);
+          rtc.time.hours = static_cast<std::uint8_t>(utc->tm_hour);
+          rtc.time.minutes = static_cast<std::uint8_t>(utc->tm_min);
+          rtc.time.seconds = static_cast<std::uint8_t>(utc->tm_sec);
+          M5.Rtc.setDateTime(rtc);
+        }
+      }
+      stamp.end();
+    }
+  }
+#endif
+
+  // RTC に妥当な時刻が入っていれば、それを使う。
+  auto rtcDate = M5.Rtc.getDateTime();
+  if (rtcDate.date.year >= 2024) {
+    std::tm timeInfo = {};
+    timeInfo.tm_year = rtcDate.date.year - 1900;
+    timeInfo.tm_mon = rtcDate.date.month - 1;
+    timeInfo.tm_mday = rtcDate.date.date;
+    timeInfo.tm_hour = rtcDate.time.hours;
+    timeInfo.tm_min = rtcDate.time.minutes;
+    timeInfo.tm_sec = rtcDate.time.seconds;
+    // RTC は UTC で持つ。timegm がないので mktime との差で補正する。
+    const std::time_t asLocal = std::mktime(&timeInfo);
+    std::tm probe = {};
+    probe.tm_year = 70;
+    probe.tm_mon = 0;
+    probe.tm_mday = 1;
+    const std::time_t epochOffset = std::mktime(&probe);
+    const std::time_t utc = asLocal - epochOffset;
+    if (utc > 1700000000) {
+      timeval now = {utc, 0};
+      settimeofday(&now, nullptr);
+      g_timeValid = true;
+      return;
+    }
+  }
+
   if (std::strlen(WIFI_SSID) == 0) {
     return;
   }
@@ -212,6 +271,19 @@ void syncTime() {
   while (millis() - ntpStart < 10000) {
     if (std::time(nullptr) > 1700000000) {
       g_timeValid = true;
+      // 次回は Wi-Fi 無しでも動くよう RTC に残す。
+      const std::time_t now = std::time(nullptr);
+      const std::tm* utc = std::gmtime(&now);
+      if (utc != nullptr) {
+        m5::rtc_datetime_t rtc;
+        rtc.date.year = static_cast<std::uint16_t>(utc->tm_year + 1900);
+        rtc.date.month = static_cast<std::uint8_t>(utc->tm_mon + 1);
+        rtc.date.date = static_cast<std::uint8_t>(utc->tm_mday);
+        rtc.time.hours = static_cast<std::uint8_t>(utc->tm_hour);
+        rtc.time.minutes = static_cast<std::uint8_t>(utc->tm_min);
+        rtc.time.seconds = static_cast<std::uint8_t>(utc->tm_sec);
+        M5.Rtc.setDateTime(rtc);
+      }
       return;
     }
     delay(200);
@@ -413,44 +485,95 @@ void drawCalibrating() {
   display.printf("n=%d      ", static_cast<int>(g_calibrationCount));
 }
 
+// ターゲットごとの色。切り替わったことが一目で分かるようにする。
+std::uint16_t targetColor(astro::Target target) {
+  switch (target) {
+  case astro::Target::North:
+    return TFT_WHITE;
+  case astro::Target::Sun:
+    return TFT_ORANGE;
+  case astro::Target::Moon:
+    return TFT_SILVER;
+  case astro::Target::Mercury:
+    return TFT_DARKGREY;
+  case astro::Target::Venus:
+    return TFT_YELLOW;
+  case astro::Target::Mars:
+    return TFT_RED;
+  case astro::Target::Jupiter:
+    return TFT_ORANGE;
+  case astro::Target::Saturn:
+    return TFT_GOLD;
+  case astro::Target::kCount:
+    break;
+  }
+  return TFT_WHITE;
+}
+
+// 方位を 16 方位の記号にする。数値より向きが掴みやすい。
+const char* compassPoint(double azimuthDegrees) {
+  static const char* kPoints[] = {"N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"};
+  auto index = static_cast<int>(std::lround(azimuthDegrees / 22.5)) % 16;
+  if (index < 0) {
+    index += 16;
+  }
+  return kPoints[index];
+}
+
 void drawStatus() {
   auto& display = M5.Display;
-  display.setTextSize(2);
 
-  display.setTextColor(TFT_WHITE, TFT_BLACK);
-  display.setCursor(4, 4);
-  display.printf("%-9s      ", astro::targetName(g_state.target));
+  // ターゲットが変わったら画面を消す。文字サイズが混在するので、
+  // 上書きだけだと前の文字が残る。
+  static astro::Target lastTarget = astro::Target::kCount;
+  static bool lastWasCalibrating = true;
+  const bool isCalibrating = g_state.phase == app::Phase::Calibrating;
+  if (g_state.target != lastTarget || isCalibrating != lastWasCalibrating) {
+    display.fillScreen(TFT_BLACK);
+    lastTarget = g_state.target;
+    lastWasCalibrating = isCalibrating;
+  }
 
-  if (g_state.phase == app::Phase::Calibrating) {
+  if (isCalibrating) {
+    display.setTextSize(2);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setCursor(4, 4);
+    display.print("compass       ");
     drawCalibrating();
     return;
   }
 
-  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  display.setCursor(4, 30);
-  display.printf("%-14s", app::phaseName(g_state.phase));
+  // ターゲット名を大きく出す。スワイプで切り替わるのが主役なので。
+  display.setTextSize(3);
+  display.setTextColor(targetColor(g_state.target), TFT_BLACK);
+  display.setCursor(4, 4);
+  display.printf("%-8s ", astro::targetName(g_state.target));
+
+  display.setTextSize(2);
 
   if (!g_state.lastPosition.valid) {
     display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    display.setCursor(4, 60);
+    display.setCursor(4, 44);
     display.print("no time sync   ");
+    display.setCursor(4, 70);
+    display.print("set wifi_config");
     return;
   }
 
+  const auto& horizontal = g_state.lastPosition.horizontal;
   display.setTextColor(TFT_CYAN, TFT_BLACK);
-  display.setCursor(4, 60);
-  display.printf("az %5.1f      ",
-                 static_cast<double>(g_state.lastPosition.horizontal.azimuthDegrees));
-  display.setCursor(4, 86);
-  display.printf("alt %+5.1f     ",
-                 static_cast<double>(g_state.lastPosition.horizontal.altitudeDegrees));
+  display.setCursor(4, 44);
+  display.printf("%-3s %5.1f    ", compassPoint(horizontal.azimuthDegrees),
+                 horizontal.azimuthDegrees);
+  display.setCursor(4, 70);
+  display.printf("alt %+5.1f     ", horizontal.altitudeDegrees);
 
-  // 首が届いていないなら伝える。黙って端に張り付くと指していると誤解される。
-  display.setCursor(4, 116);
+  // 指せているかを伝える。黙って端に張り付くと指していると誤解される。
+  display.setCursor(4, 104);
   if (g_state.lastSolve.command.clampedPitch) {
     display.setTextColor(TFT_ORANGE, TFT_BLACK);
-    display.printf("%+.0f deg higher  ",
-                   static_cast<double>(g_state.lastSolve.unreachablePitchDegrees));
+    display.printf("%+.0f deg higher ", g_state.lastSolve.unreachablePitchDegrees);
   } else if (g_state.lastSolve.command.clampedYaw) {
     display.setTextColor(TFT_ORANGE, TFT_BLACK);
     display.print("turn me around ");
@@ -462,10 +585,17 @@ void drawStatus() {
     display.print("pointing       ");
   }
 
+  // 下段は状態。方位が無効なら赤で示す。
+  display.setTextSize(1);
   display.setTextColor(g_headingValid ? TFT_DARKGREY : TFT_RED, TFT_BLACK);
-  display.setCursor(4, 146);
-  display.printf("hdg %5.1f %s  ", static_cast<double>(g_bodyTrueHeading),
-                 g_state.autoCycleEnabled ? "auto" : "    ");
+  display.setCursor(4, 138);
+  display.printf("hdg %5.1f  %-13s %s    ", g_bodyTrueHeading, app::phaseName(g_state.phase),
+                 g_state.autoCycleEnabled ? "AUTO" : "");
+
+  // 操作の案内。触れば分かるが、最初の一回のために出しておく。
+  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  display.setCursor(4, 152);
+  display.print("swipe: target   tap: auto");
 }
 
 } // namespace

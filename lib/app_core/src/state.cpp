@@ -199,10 +199,14 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
   }
 
   case Phase::Pointing: {
-    const bool settled =
-        tick.servoSettled &&
+    // 指令を出してから一定時間経てば追尾へ移る。
+    //
+    // Why not サーボの静止を待つ: 指した先が可動域の端だと、サーボは目標に
+    // 到達できず微振動を続ける。静止を条件にすると永久に抜けられない
+    // (実機で発生)。時間だけで区切り、実際に指せたかは UI が clamped で示す。
+    const bool waited =
         elapsedSince(tick.nowMillis, state.phaseEnteredMillis) >= config.servoSettleMillis;
-    if (settled) {
+    if (waited) {
       enterPhase(state, Phase::Tracking, tick.nowMillis);
     }
     return;
