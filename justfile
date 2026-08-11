@@ -78,6 +78,21 @@ read-nvs filter='':
       python3 scripts/read_nvs.py "$port" \
       "$PLATFORMIO_CORE_DIR/packages/tool-esptoolpy/esptool.py" {{ filter }}
 
+# 実機の動作を検証する。キャリブレーション・時刻・方位・ターゲット切り替えを
+# 順に確かめ、足りないものを具体的に出す。
+verify:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    port=$(pio device list --json-output \
+      | python3 -c 'import json,sys; print(next((d["port"] for d in json.load(sys.stdin) if "303A:1001" in (d.get("hwid") or "")), ""))')
+    if [ -z "$port" ]; then
+      echo "CoreS3 が見つかりません (hwid 303A:1001)" >&2
+      exit 1
+    fi
+    PYTHONPATH="$PLATFORMIO_CORE_DIR/packages/tool-esptoolpy:${PYTHONPATH:-}" \
+      python3 scripts/verify_device.py "$port" \
+      "$PLATFORMIO_CORE_DIR/packages/tool-esptoolpy/esptool.py"
+
 clean:
     pio run --project-dir firmware --target clean
     rm -rf build
