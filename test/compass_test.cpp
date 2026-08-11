@@ -19,6 +19,25 @@ namespace {
 
 constexpr float kPi = 3.14159265358979323846F;
 
+void testCoreS3AxesMapToDisplayFace() {
+  // CoreS3の画面表側Z、画面右X、画面上Yが、顔座標の前X、右Y、上Zになること。
+  const compass::Vec3 mapped =
+      compass::stackChanFaceFrameFromCoreS3(compass::Vec3{1.0F, 2.0F, 3.0F});
+  CHECK_NEAR(mapped.x, 3.0F, 1e-6);
+  CHECK_NEAR(mapped.y, 1.0F, 1e-6);
+  CHECK_NEAR(mapped.z, 2.0F, 1e-6);
+}
+
+void testDisplayFaceHeadingUsesCoreS3Normal() {
+  // 縦置きの画面が東を向くとき、画面法線を前として90度を返すこと。
+  constexpr float kHorizontalField = 30.0F;
+  constexpr float kVerticalField = 34.0F;
+  const compass::Vec3 faceFrameMag{0.0F, kHorizontalField, kVerticalField};
+  const compass::Vec3 coreS3Mag{faceFrameMag.y, faceFrameMag.z, faceFrameMag.x};
+  const compass::Vec3 mapped = compass::stackChanFaceFrameFromCoreS3(coreS3Mag);
+  CHECK_NEAR_ANGLE(compass::tiltCompensatedHeadingDegrees(mapped, compass::Attitude{}), 90.0, 1e-3);
+}
+
 compass::Vec3 rotateVector(compass::Vec3 value, float rollRadians, float pitchRadians) {
   // 機体を roll → pitch の順に傾けたとき、機体座標で観測される値を作る。
   // tiltCompensatedHeadingDegrees の逆変換にあたる。
@@ -176,7 +195,7 @@ void testTiltCompensationRoundTrip() {
     // 水平姿勢での機体座標の磁場。x が機首方向。
     compass::Vec3 levelField;
     levelField.x = kFieldStrength * std::cos(kInclination) * std::cos(headingRadians);
-    levelField.y = -kFieldStrength * std::cos(kInclination) * std::sin(headingRadians);
+    levelField.y = kFieldStrength * std::cos(kInclination) * std::sin(headingRadians);
     levelField.z = kFieldStrength * std::sin(kInclination);
 
     // 水平姿勢では補正の有無にかかわらず方位が出る
@@ -450,6 +469,8 @@ void testDeclination() {
 } // namespace
 
 int main() {
+  testCoreS3AxesMapToDisplayFace();
+  testDisplayFaceHeadingUsesCoreS3Normal();
   testCalibrationRecovery();
   testCalibrationRejectsInsufficientData();
   testCalibrationRejectsNarrowRotation();

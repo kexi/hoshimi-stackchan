@@ -12,6 +12,10 @@ struct Attitude {
   float pitchRadians = 0.0F;
 };
 
+// CoreS3のセンサー座標を、スタックチャンの顔を基準にした座標へ写す。
+// 戻り値は X=ディスプレイ正面、Y=顔から見た右、Z=画面上方向。
+[[nodiscard]] Vec3 stackChanFaceFrameFromCoreS3(Vec3 coreS3Vector);
+
 // 重力ベクトルから roll/pitch を出す。静止していることが前提。
 [[nodiscard]] Attitude attitudeFromAccel(Vec3 accel);
 

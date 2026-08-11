@@ -34,7 +34,7 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
+          packages = (with pkgs; [
             actionlint
             clang-tools
             cmake
@@ -51,7 +51,7 @@
             python3Packages.pyserial
             ripgrep
             uv
-          ];
+          ]) ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.avahi ];
 
           shellHook = ''
             # ツールチェーンをリポジトリ局所に閉じ込め、$HOME を汚さない (.gitignore 済み)

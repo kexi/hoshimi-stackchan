@@ -66,11 +66,6 @@ public:
     float headingDispersionDegrees = 0.0F;
     // 測定時の首の角度。正面から外れていると採用しない。
     int yawDeciDegrees = 0;
-    // 首の角度によるずれを補正できるか (ServoBiasTable が学習済みか)。
-    //
-    // 真なら首が横を向いていても測ってよい。持ち歩きながら指し続けるには、
-    // 指した姿勢のまま方位を追える必要がある。
-    bool biasCorrected = false;
   };
 
   enum class Reject : std::uint8_t {
@@ -103,12 +98,10 @@ private:
 
 [[nodiscard]] const char* rejectName(MeasurementGate::Reject reject);
 
-// サーボ角度に依存する磁気バイアスの補正表。
+// サーボ角度に依存する磁気バイアスの実験用補正表。
 //
-// ゲート (層 1-3) を通してなお、首の「位置」による静的バイアスが残る。
-// サーボの永久磁石そのものが動くためで、トルクを切っても消えない。
-// yaw をビンに離散化し、機体を固定したまま首だけ振ったときの方位測定値の
-// ずれを学習する (機体が動いていないなら真方位は全ビンで同一のはず)。
+// yawごとの角度差を調べる分析には使えるが、実機の横向きではpitchと磁場強度も
+// 変わるためMeasurementGateの迂回には使わない。実際の方位は正面姿勢で測る。
 class ServoBiasTable {
 public:
   static constexpr std::size_t kBinCount = 16;

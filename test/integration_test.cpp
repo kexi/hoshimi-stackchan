@@ -144,7 +144,7 @@ void testFullChainFromSyntheticMagnetometer() {
 
     compass::Vec3 magneticField;
     magneticField.x = kFieldStrength * std::cos(kInclination) * std::cos(headingRadians);
-    magneticField.y = -kFieldStrength * std::cos(kInclination) * std::sin(headingRadians);
+    magneticField.y = kFieldStrength * std::cos(kInclination) * std::sin(headingRadians);
     magneticField.z = kFieldStrength * std::sin(kInclination);
 
     const compass::Attitude attitude = compass::attitudeFromAccel(compass::Vec3{0.0F, 0.0F, 1.0F});

@@ -137,6 +137,21 @@ watch seconds='30':
 logs seconds='30':
     just watch {{ seconds }}
 
+# Wi-FiとmDNSでStack-chanを見つけ、指定した天体へ切り替える。
+# 例: just target moon / just target 火星 / just target 7
+target target host='':
+    uv run scripts/select_target.py {{ quote(target) }} {{ quote(host) }}
+
+# 生のCoreS3軸と顔基準へ変換後の最新センサー値をWi-Fi経由で取得する。
+# 例: just sensors / just sensors stackchan-xxxxxx.local
+sensors host='':
+    uv run scripts/read_sensors.py {{ quote(host) }}
+
+# 傾き許容角を実行中RAMへ適用して校正を再開始する。再flashは不要。
+# 例: just calibrate 10 / just calibrate 10 stackchan-xxxxxx.local
+calibrate max_tilt='10' host='':
+    uv run scripts/configure_calibration.py {{ quote(max_tilt) }} {{ quote(host) }}
+
 # 実機の動作を検証する。キャリブレーション・時刻・方位・ターゲット切り替えを
 # 順に確かめ、足りないものを具体的に出す。
 verify seconds='120':

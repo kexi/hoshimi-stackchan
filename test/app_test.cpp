@@ -33,8 +33,6 @@ app::Tick healthyTick(std::uint32_t nowMillis) {
   tick.headingValid = true;
   tick.measurementAccepted = true;
   tick.servoSettled = true;
-  // 補正済みの定常状態を既定にする。未補正の経路は専用の入力で見る。
-  tick.biasCorrected = true;
   return tick;
 }
 
@@ -48,12 +46,7 @@ std::size_t utf8CodePointCount(std::string_view text) {
   return count;
 }
 
-// 首のクセをまだ覚えていない状態。首を正面へ戻さないと方位が読めない。
-app::Tick uncorrectedTick(std::uint32_t nowMillis) {
-  app::Tick tick = healthyTick(nowMillis);
-  tick.biasCorrected = false;
-  return tick;
-}
+app::Tick measurementTick(std::uint32_t nowMillis) { return healthyTick(nowMillis); }
 
 // 状態が変わらなくなるか、上限に達するまで進める。
 void advanceUntil(app::State& state, app::Phase wanted, std::uint32_t& clock,
@@ -64,12 +57,12 @@ void advanceUntil(app::State& state, app::Phase wanted, std::uint32_t& clock,
   }
 }
 
-// 補正を使えない状態から、指定した局面まで進める。
-void advanceUncorrected(app::State& state, app::Phase wanted, std::uint32_t& clock,
-                        const app::Config& config) {
+// 正面の測定姿勢を使う経路で、指定した局面まで進める。
+void advanceUsingMeasurePose(app::State& state, app::Phase wanted, std::uint32_t& clock,
+                             const app::Config& config) {
   for (int guard = 0; guard < 500 && state.phase != wanted; ++guard) {
     clock += 200;
-    app::step(state, uncorrectedTick(clock), config, tokyoObserver());
+    app::step(state, measurementTick(clock), config, tokyoObserver());
   }
 }
 
@@ -83,6 +76,7 @@ void testBootReachesTracking() {
   advanceUntil(state, app::Phase::Tracking, clock, config);
   CHECK_TRUE(state.phase == app::Phase::Tracking);
   CHECK_TRUE(state.hasSolve);
+  CHECK_TRUE(state.autoCycleEnabled);
   // 既定ターゲットは真北なので、機体が真北を向いていれば首は正面
   CHECK_TRUE(state.target == astro::Target::North);
   CHECK_TRUE(state.lastSolve.command.yawDeciDegrees == 0);
@@ -183,27 +177,52 @@ void testSwipeChangesTarget() {
   CHECK_TRUE(app::nextTarget(astro::Target::Saturn) == astro::Target::North);
 }
 
-void testClickTogglesAutoCycle() {
+void testDirectTargetSelection() {
+  // Wi-Fiから特定対象を指定すると、順送りせず直接切り替わることを保証する。
+  app::State state;
+  app::Config config;
+  std::uint32_t clock = 0;
+  advanceUntil(state, app::Phase::Tracking, clock, config);
+  state.autoCycleEnabled = true;
+
+  clock += 200;
+  app::Tick selection = healthyTick(clock);
+  selection.targetSelectionRequested = true;
+  selection.requestedTarget = astro::Target::Mars;
+  app::step(state, selection, config, tokyoObserver());
+
+  CHECK_TRUE(state.target == astro::Target::Mars);
+  CHECK_TRUE(!state.autoCycleEnabled);
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+}
+
+void testAutoCycleStartsEnabledAndClickToggles() {
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
   advanceUntil(state, app::Phase::Tracking, clock, config);
 
-  CHECK_TRUE(!state.autoCycleEnabled);
-
-  clock += 200;
-  app::Tick click = healthyTick(clock);
-  click.input = app::Input::Click;
-  app::step(state, click, config, tokyoObserver());
   CHECK_TRUE(state.autoCycleEnabled);
 
-  // 自動巡回中は一定時間でターゲットが進む
+  // 起動後は自動巡回し、一定時間でターゲットが進むこと。
   const astro::Target before = state.target;
   for (int step = 0; step < 100; ++step) {
     clock += 200;
     app::step(state, healthyTick(clock), config, tokyoObserver());
   }
   CHECK_TRUE(state.target != before);
+
+  clock += 200;
+  app::Tick click = healthyTick(clock);
+  click.input = app::Input::Click;
+  app::step(state, click, config, tokyoObserver());
+  CHECK_TRUE(!state.autoCycleEnabled);
+
+  // もう一度タップすれば巡回を再開できること。
+  clock += 200;
+  click.nowMillis = clock;
+  app::step(state, click, config, tokyoObserver());
+  CHECK_TRUE(state.autoCycleEnabled);
 
   // 手動スワイプが入ったら自動巡回は止まる (選んだ意味がなくなるため)
   clock += 200;
@@ -257,8 +276,7 @@ void testTrackingEscapesWhenHeadingWasNeverTaken() {
 }
 
 void testBodyMovementTriggersRemeasure() {
-  // 首のクセをまだ覚えていないときは、機体が動いたら測り直すこと。
-  // この状態では首を正面へ戻さないと方位が読めない。
+  // 機体が動いたら古い方位を破棄し、正面・水平で測り直すこと。
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
@@ -267,11 +285,19 @@ void testBodyMovementTriggersRemeasure() {
 
   clock += 200;
   app::Tick shaken = healthyTick(clock);
-  shaken.biasCorrected = false;
   shaken.gyroMagnitudeDegPerSec = 120.0F;
   app::step(state, shaken, config, tokyoObserver());
-  // 機体が動かされたら、首を正面に戻して測り直す
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+  CHECK_TRUE(!state.hasHeading);
+  CHECK_TRUE(!state.hasSolve);
+  CHECK_TRUE(state.forceMeasurementPose);
+  CHECK_TRUE(state.headingResetRequested);
+  CHECK_TRUE(state.bodyMotionCount == 1);
+
+  const app::ServoIntent intent = app::servoIntentFor(state);
+  CHECK_TRUE(intent.yawDeciDegrees == compass::kMeasurementYawDeci);
+  CHECK_TRUE(intent.pitchDeciDegrees == pointing::kPitchLevelDeci);
+  CHECK_TRUE(intent.shouldMove);
 }
 
 void testServoMotionDoesNotTriggerRemeasure() {
@@ -286,7 +312,6 @@ void testServoMotionDoesNotTriggerRemeasure() {
 
   clock += 200;
   app::Tick servoMotion = healthyTick(clock);
-  servoMotion.biasCorrected = false;
   servoMotion.servoSettled = false;
   servoMotion.gyroMagnitudeDegPerSec = 120.0F;
   app::step(state, servoMotion, config, tokyoObserver());
@@ -296,7 +321,6 @@ void testServoMotionDoesNotTriggerRemeasure() {
 
   clock += config.gyroAfterServoSettleMillis - 1;
   app::Tick inertia = healthyTick(clock);
-  inertia.biasCorrected = false;
   inertia.servoSettled = true;
   inertia.gyroMagnitudeDegPerSec = 120.0F;
   app::step(state, inertia, config, tokyoObserver());
@@ -304,85 +328,92 @@ void testServoMotionDoesNotTriggerRemeasure() {
 
   clock += 1;
   app::Tick bodyMotion = healthyTick(clock);
-  bodyMotion.biasCorrected = false;
   bodyMotion.servoSettled = true;
   bodyMotion.gyroMagnitudeDegPerSec = 120.0F;
   app::step(state, bodyMotion, config, tokyoObserver());
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 }
 
-void testIncompleteBiasLearningDoesNotBlockNorth() {
-  // 首の補正表が空でも、正面で方位を採れば真北を指せること。
-  // 補正表の完成を起動条件にすると、端のサーボが区画へ届かない個体では
-  // 学習が永久に終わらず、基本機能の真北を一度も指せない。
+void testMeasurementPoseCanPointNorth() {
+  // 正面で方位を採れば、追加の首角度モデルなしで真北を指せること。
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
 
   for (int step = 0; step < 80 && state.phase != app::Phase::Tracking; ++step) {
     clock += 200;
-    app::step(state, uncorrectedTick(clock), config, tokyoObserver());
+    app::step(state, measurementTick(clock), config, tokyoObserver());
   }
   CHECK_TRUE(state.phase == app::Phase::Tracking);
   CHECK_TRUE(state.target == astro::Target::North);
   CHECK_TRUE(state.hasSolve);
 }
 
-void testBiasCorrectedTrackingSurvivesMovement() {
-  // バイアス表が学習済みなら、持ち歩いて機体が動き続けても追尾に留まること。
-  //
-  // 首の角度によるずれを打ち消せるので、首を正面へ戻さなくても方位が読める。
-  // ここで測定に戻ると、歩いている間は指すことも測ることもできなくなる。
+void testMovementForcesFreshMeasurement() {
+  // 本体移動後は古い方位を使わず基準姿勢へ戻ること。
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
 
-  // バイアス補正が効いた状態で追尾まで進める
-  auto movingTick = [&](std::uint32_t nowMillis) {
-    app::Tick tick = healthyTick(nowMillis);
-    tick.biasCorrected = true;
-    tick.gyroMagnitudeDegPerSec = 120.0F; // 歩いている
-    return tick;
-  };
-
-  for (int step = 0; step < 400 && state.phase != app::Phase::Tracking; ++step) {
-    clock += 200;
-    app::step(state, movingTick(clock), config, tokyoObserver());
-  }
+  advanceUntil(state, app::Phase::Tracking, clock, config);
   CHECK_TRUE(state.phase == app::Phase::Tracking);
 
-  // 揺れ続けても追尾から出ない
-  for (int step = 0; step < 100; ++step) {
-    clock += 200;
-    app::step(state, movingTick(clock), config, tokyoObserver());
-    CHECK_TRUE(state.phase == app::Phase::Tracking);
-  }
-  // 動きながらでも指令が更新され続けること
+  clock += 200;
+  app::Tick moved = healthyTick(clock);
+  moved.gyroMagnitudeDegPerSec = 20.0F;
+  app::step(state, moved, config, tokyoObserver());
+
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+  CHECK_TRUE(state.forceMeasurementPose);
+  CHECK_TRUE(state.headingResetRequested);
+  CHECK_TRUE(!state.hasHeading);
+
+  const app::ServoIntent intent = app::servoIntentFor(state);
+  CHECK_TRUE(intent.yawDeciDegrees == compass::kMeasurementYawDeci);
+  CHECK_TRUE(intent.pitchDeciDegrees == pointing::kPitchLevelDeci);
+
+  clock += 200;
+  app::Tick waiting = healthyTick(clock);
+  app::step(state, waiting, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
+  CHECK_TRUE(state.forceMeasurementPose);
+  CHECK_TRUE(!state.headingResetRequested);
+
+  clock += config.measurePoseSettleMillis;
+  app::Tick settled = healthyTick(clock);
+  app::step(state, settled, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::Measuring);
+
+  clock += 200;
+  app::Tick measured = healthyTick(clock);
+  measured.bodyTrueHeadingDegrees = 123.0F;
+  app::step(state, measured, config, tokyoObserver());
+  CHECK_TRUE(state.phase == app::Phase::Pointing);
+  CHECK_TRUE(state.hasHeading);
+  CHECK_NEAR(state.bodyHeadingDegrees, 123.0F, 0.001F);
+  CHECK_TRUE(!state.forceMeasurementPose);
   CHECK_TRUE(state.hasSolve);
 }
 
-void testBiasCorrectedSkipsMeasurePose() {
-  // バイアス表があるなら、測定のために首を正面へ戻さないこと。
-  //
-  // 戻すと指している方向を見失う。持ち歩きながら指し続けるには、
-  // 指したままの姿勢で測れる必要がある。
-  app::State withBias;
-  withBias.biasCorrected = true;
-  withBias.phase = app::Phase::Measuring;
-  withBias.hasSolve = true;
-  withBias.lastSolve.command.yawDeciDegrees = 700;
-  withBias.lastSolve.command.pitchDeciDegrees = 600;
-  withBias.lastSolve.shouldMove = true;
+void testMeasurementAlwaysUsesMeasurePose() {
+  // 横向きではpitchと磁場強度も変わるので、正面・水平姿勢を使うこと。
+  app::State measuring;
+  measuring.phase = app::Phase::Measuring;
+  measuring.hasSolve = true;
+  measuring.lastSolve.command.yawDeciDegrees = 700;
+  measuring.lastSolve.command.pitchDeciDegrees = 600;
+  measuring.lastSolve.shouldMove = true;
 
-  const app::ServoIntent corrected = app::servoIntentFor(withBias);
-  CHECK_TRUE(corrected.yawDeciDegrees == 700);
+  const app::ServoIntent intent = app::servoIntentFor(measuring);
+  CHECK_TRUE(intent.yawDeciDegrees == compass::kMeasurementYawDeci);
+  CHECK_TRUE(intent.pitchDeciDegrees == pointing::kPitchLevelDeci);
+  CHECK_TRUE(intent.shouldMove);
 
-  // 表が無ければ従来どおり正面へ戻す
-  app::State withoutBias = withBias;
-  withoutBias.biasCorrected = false;
+  measuring.phase = app::Phase::ReturningToMeasurePose;
 
-  const app::ServoIntent uncorrected = app::servoIntentFor(withoutBias);
-  CHECK_TRUE(uncorrected.yawDeciDegrees == compass::kMeasurementYawDeci);
+  const app::ServoIntent returning = app::servoIntentFor(measuring);
+  CHECK_TRUE(returning.yawDeciDegrees == compass::kMeasurementYawDeci);
+  CHECK_TRUE(returning.pitchDeciDegrees == pointing::kPitchLevelDeci);
 }
 
 void testMillisWrapDoesNotBreakTransitions() {
@@ -446,12 +477,12 @@ void testMeasurementPoseIsCommanded() {
 
   // Measuring / ReturningToMeasurePose を通るまで進める。
   // 補正が使えないときは、測定のたびに正面へ戻る必要がある。
-  advanceUncorrected(state, app::Phase::ReturningToMeasurePose, clock, config);
+  advanceUsingMeasurePose(state, app::Phase::ReturningToMeasurePose, clock, config);
 
   bool sawMeasurePose = false;
   for (int step = 0; step < 60; ++step) {
     clock += 200;
-    app::step(state, uncorrectedTick(clock), config, tokyoObserver());
+    app::step(state, measurementTick(clock), config, tokyoObserver());
     const bool isMeasurePhase =
         state.phase == app::Phase::ReturningToMeasurePose || state.phase == app::Phase::Measuring;
     if (!isMeasurePhase) {
@@ -511,17 +542,17 @@ void testMeasurePoseSettleIsRespected() {
   std::uint32_t clock = 0;
 
   // 首のクセを覚える前は、正面へ戻して落ち着くのを待つ必要がある。
-  advanceUncorrected(state, app::Phase::ReturningToMeasurePose, clock, config);
+  advanceUsingMeasurePose(state, app::Phase::ReturningToMeasurePose, clock, config);
   const std::uint32_t entered = clock;
 
   // settle 未満では Measuring に進まない
   clock += 400;
-  app::step(state, uncorrectedTick(clock), config, tokyoObserver());
+  app::step(state, measurementTick(clock), config, tokyoObserver());
   CHECK_TRUE(state.phase == app::Phase::ReturningToMeasurePose);
 
   // settle を超えたら進む
   clock = entered + 1200;
-  app::step(state, uncorrectedTick(clock), config, tokyoObserver());
+  app::step(state, measurementTick(clock), config, tokyoObserver());
   CHECK_TRUE(state.phase == app::Phase::Measuring);
 }
 
@@ -581,14 +612,15 @@ int main() {
   testTimeInvalidStillPointsNorth();
   testMeasurementTimeoutWithoutHeading();
   testSwipeChangesTarget();
-  testClickTogglesAutoCycle();
+  testDirectTargetSelection();
+  testAutoCycleStartsEnabledAndClickToggles();
   testTrackingStaysWhileNeckIsAway();
   testTrackingEscapesWhenHeadingWasNeverTaken();
   testBodyMovementTriggersRemeasure();
   testServoMotionDoesNotTriggerRemeasure();
-  testIncompleteBiasLearningDoesNotBlockNorth();
-  testBiasCorrectedTrackingSurvivesMovement();
-  testBiasCorrectedSkipsMeasurePose();
+  testMeasurementPoseCanPointNorth();
+  testMovementForcesFreshMeasurement();
+  testMeasurementAlwaysUsesMeasurePose();
   testMillisWrapDoesNotBreakTransitions();
   testTrackingUpdatesAsSkyMoves();
   return testing::summarize("app");

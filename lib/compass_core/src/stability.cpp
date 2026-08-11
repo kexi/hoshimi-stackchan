@@ -53,9 +53,10 @@ MeasurementGate::Reject MeasurementGate::evaluate(const Input& input) const {
   // 首が正面にないと最大 119 度ずれる (段階 8 実測)。他のどの要因より大きいので
   // 最初に見る。
   //
-  // ただし ServoBiasTable が学習済みなら、その角度のずれは打ち消せている。
-  // 首を正面へ戻さずに測れないと、持ち歩きながら指し続けることができない。
-  if (!input.biasCorrected && !isMeasurementPose(input.yawDeciDegrees)) {
+  // Why not yaw角だけの補正表を使う: K151実機では横向きかつpitchが大きい姿勢で
+  // 磁場強度そのものが大幅に変わった。角度差だけでは補正できないため、同じ
+  // 正面・水平姿勢で採った値だけを方位に使う。
+  if (!isMeasurementPose(input.yawDeciDegrees)) {
     return Reject::NotMeasurementPose;
   }
 

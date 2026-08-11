@@ -3,8 +3,8 @@
 // 真北と天体 (太陽・月・水星〜土星) の方向を、首で物理的に指し示す。
 // yaw で方位を、pitch で高度を表す。
 //
-// 未学習の首角度では、磁気測定前に首を正面へ戻す。首の角度によって方位が最大
-// 119 度ずれるためで、学習済み角度だけServoBiasTableで補正する。
+// 磁気測定前に首を正面へ戻す。首の角度によって方位が最大119度ずれ、横向きでは
+// 磁場強度も変わるため、同じ測定姿勢の値だけを方位として採用する。
 // ロジックは app_core 側にあり、ここは実機の入出力をstate machineへ橋渡しする。
 //
 // 状態はシリアルへ出す (just watch / just verify で読む)。
@@ -21,6 +21,7 @@
 #include <M5Unified.h>
 #include <NetworkClientSecure.h>
 #include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <esp_mac.h>
 #include <esp_sntp.h>
@@ -71,18 +72,17 @@
 
 namespace {
 
-constexpr const char* kBiasNamespace = "bias";
 constexpr const char* kLevelNamespace = "level";
 constexpr const char* kGeoIpNamespace = "geoip";
-// 水平方位の基準や学習規則を変えたら上げる。旧基準の補正量は混ぜない。
-constexpr std::uint32_t kBiasStorageVersion = 3;
-// v1以前は交差軸の歪みを持たず、水平投影後の回転楕円を補正できない。
-constexpr std::uint32_t kLevelStorageVersion = 2;
+// v5はサーボ停止直後の慣性を校正サンプルへ混ぜず、反転前の方位校正を破棄する。
+constexpr std::uint32_t kLevelStorageVersion = 5;
 constexpr std::uint32_t kGeoIpStorageVersion = 1;
 constexpr int kMoveSpeed = 400;
 constexpr std::uint32_t kGeoIpRefreshSeconds = 24 * 60 * 60;
 constexpr std::uint32_t kNetworkRetryMillis = 5 * 60 * 1000;
 constexpr std::uint16_t kGeoIpHttpTimeoutMillis = 5000;
+constexpr int kControlHttpPort = 80;
+constexpr int kTargetCount = static_cast<int>(astro::Target::kCount);
 
 // 水平投影したキャリブレーションのサンプルを全点保持して円に当てはめる。
 //
@@ -98,39 +98,18 @@ constexpr float kMinFieldRadiusMicroTesla = 12.0F;
 constexpr float kMaxCalibrationResidual = 0.25F;
 // 当てはめは数百点の最小二乗で重い。毎周期回すとウォッチドッグを踏む。
 constexpr std::uint32_t kFitIntervalMillis = 700;
+// 静止中の同一点でバッファを埋めず、速度によらず一周分の異なる点だけを採る。
+// BMM150の静止ノイズより十分広く、水平地磁気の円周からは24点以上採れる間隔。
+constexpr float kDefaultCalibrationMinimumPointDistanceMicroTesla = 1.5F;
+constexpr float kDefaultCalibrationMaxTiltDegrees = 10.0F;
+constexpr float kDefaultCalibrationMinimumGravityDot = 0.9848078F;
+constexpr float kCalibrationMinimumRotationRateDegreesPerSecond = 10.0F;
+constexpr std::size_t kMagneticAverageWindow = 32;
 // 状態をシリアルへ出す間隔。局面の遷移が追える程度に細かくする。
 // NVS への書き込みはこれより間引く (フラッシュの摩耗を避けるため)。
 constexpr std::uint32_t kProbeIntervalMillis = 500;
 constexpr std::uint32_t kNvsProbeIntervalMillis = 30000;
-constexpr std::uint32_t kBiasSaveIntervalMillis = 30000;
-// 正面で採った方位を、バイアス学習の基準として使える時間。
-//
-// 古い基準を使うと、その間に機体が動いていた分だけ誤って覚える。実機では
-// 掃引の後半ほど基準からずれ、学習後の方位が測るたびに 270 度飛んだ。
-constexpr std::uint32_t kBiasBasisValidMillis = 4000;
 constexpr int kServoArrivalToleranceDeci = compass::kMeasurementYawToleranceDeci;
-
-// CoreS3ではBMM150がBMI270のAUX I2C配下にある。M5Unified 0.2.19は
-// BMM150の反復回数を既定値1のままにするため、Bosch推奨の高精度設定を適用する。
-constexpr std::uint8_t kBmi270Address = 0x69;
-constexpr std::uint8_t kBmi270AuxDataRegister = 0x04;
-constexpr std::uint8_t kBmi270StatusRegister = 0x03;
-constexpr std::uint8_t kBmi270AuxInterfaceConfigRegister = 0x4C;
-constexpr std::uint8_t kBmi270AuxReadAddressRegister = 0x4D;
-constexpr std::uint8_t kBmi270AuxWriteAddressRegister = 0x4E;
-constexpr std::uint8_t kBmi270AuxWriteDataRegister = 0x4F;
-constexpr std::uint8_t kBmi270AuxBusyMask = 0x04;
-constexpr std::uint8_t kBmi270AuxManualReadConfig = 0x80;
-constexpr std::uint8_t kBmi270AuxAutomaticReadConfig = 0x4F;
-constexpr std::uint8_t kBmm150DataStartRegister = 0x42;
-constexpr std::uint8_t kBmm150OperationModeRegister = 0x4C;
-constexpr std::uint8_t kBmm150XyRepetitionsRegister = 0x51;
-constexpr std::uint8_t kBmm150ZRepetitionsRegister = 0x52;
-constexpr std::uint8_t kBmm150SleepMode30Hz = 0x3E;
-constexpr std::uint8_t kBmm150HighAccuracyXyRepetitions = 23;
-constexpr std::uint8_t kBmm150HighAccuracyZRepetitions = 82;
-constexpr std::uint8_t kBmm150NormalMode20Hz = 0x28;
-constexpr std::uint32_t kInternalI2cFrequency = 400000;
 
 struct ServoAngles {
   int yawDeci = 0;
@@ -174,8 +153,21 @@ bool g_geoIpAttempted = false;
 std::uint32_t g_lastMdnsAttemptMillis = 0;
 std::uint32_t g_lastGeoIpAttemptMillis = 0;
 std::atomic<bool> g_ntpSyncPending{false};
+std::atomic<int> g_requestedTarget{-1};
 StoredGeoIpLocation g_storedGeoIp;
 bool g_hasStoredGeoIp = false;
+WebServer g_controlServer{kControlHttpPort};
+bool g_controlServerStarted = false;
+
+struct CalibrationTuning {
+  // 数値自体は小さいので内部RAMへ置く。大量の測定点だけをPSRAMへ逃がす。
+  float maxTiltDegrees = kDefaultCalibrationMaxTiltDegrees;
+  float minimumGravityDot = kDefaultCalibrationMinimumGravityDot;
+  float minimumPointDistanceMicroTesla = kDefaultCalibrationMinimumPointDistanceMicroTesla;
+};
+
+// 試行値は再起動で安全な既定値へ戻す。合格した補正結果だけをNVSへ保存する。
+CalibrationTuning g_calibrationTuning;
 
 // 水平回転で取る補正。この機体は本体に強い磁石があり、傾けると磁石も一緒に
 // 動くので 8 の字回しでは地磁気の球にならない (実機で半径 169uT = 地磁気の
@@ -183,6 +175,10 @@ bool g_hasStoredGeoIp = false;
 compass::LevelCalibration g_level;
 // 直近の当てはめの被覆率。描画から読むだけにして、当てはめは間隔を空けて回す。
 float g_calibrationCoverage = 0.0F;
+float g_calibrationCandidateRadius = 0.0F;
+float g_calibrationCandidateResidual = 1.0F;
+std::uint32_t g_calibrationFitCount = 0;
+std::uint32_t g_calibrationTiltResetCount = 0;
 // キャリブレーション開始時の重力方向。ここから外れたサンプルは採らない。
 compass::Vec3 g_referenceGravity;
 // タッチ入力を受けた回数。実機でスワイプが検出されているかを見る。
@@ -198,19 +194,8 @@ compass::MeasurementGate g_gate;
 // 平滑化を強めにする。
 //
 // 0.5 だと実機で方位が 12 度揺れ、それが首の指令にそのまま出て小刻みに
-// 動き続けた。首を正面に戻さず測るようになった分、値のばらつきが増えている。
+// 動き続けた。正面姿勢でも残る磁気ノイズを平均してから採用する。
 compass::HeadingFilter g_headingFilter{0.15F};
-// 首の角度による方位のずれ (実測で最大 119 度) を角度ごとに覚える表。
-//
-// これがあると、首を正面に戻さなくても方位が読める。持ち歩きながら天体を
-// 指し続けるには、指した姿勢のまま方位を追える必要がある。
-compass::ServoBiasTable g_biasTable;
-// 正面で採った方位。バイアス表を学習するときの真値として使う。
-float g_measurePoseHeading = 0.0F;
-std::uint32_t g_measurePoseHeadingMillis = 0;
-bool g_hasMeasurePoseHeading = false;
-// 表を書き換えたが、まだ NVS に落としていない。
-bool g_biasDirty = false;
 
 compass::Vec3* g_calibrationSamples = nullptr;
 std::size_t g_calibrationCount = 0;
@@ -219,24 +204,38 @@ bool g_timeValid = false;
 bool g_headingValid = false;
 float g_bodyTrueHeading = 0.0F;
 esp_reset_reason_t g_bootResetReason = ESP_RST_UNKNOWN;
-bool g_magnetometerHighAccuracy = false;
-std::uint8_t g_bmm150XyRepetitions = 0;
-std::uint8_t g_bmm150ZRepetitions = 0;
-std::uint8_t g_bmm150OperationMode = 0;
+compass::Vec3 g_lastCoreMag;
 compass::Vec3 g_lastRawMag;
+compass::Vec3 g_lastSensorMag;
+compass::Vec3 g_lastCoreAccel;
 compass::Vec3 g_lastAccel;
+compass::Vec3 g_lastObservedAccel;
+compass::Vec3 g_lastCoreGyro;
+compass::Vec3 g_lastFaceGyro;
+float g_lastGyroMagnitude = 0.0F;
+std::uint32_t g_lastGyroReadMillis = 0;
+bool g_hasRawMagSample = false;
+std::uint32_t g_lastMagChangeMillis = 0;
+std::uint32_t g_magnetometerChangeCount = 0;
+std::uint32_t g_magnetometerRepeatedCount = 0;
+std::array<compass::Vec3, kMagneticAverageWindow> g_magneticAverageSamples{};
+compass::Vec3 g_magneticAverageSum;
+std::size_t g_magneticAverageIndex = 0;
+std::size_t g_magneticAverageCount = 0;
 
 std::uint32_t g_lastServoStopMillis = 0;
 std::uint32_t g_lastObservedServoMotionMillis = 0;
 int g_commandedYaw = 0;
 int g_commandedPitch = pointing::kPitchLevelDeci;
+ServoAngles g_lastServoAngles;
 
 compass::Vec3 readMag() {
   float x = 0.0F;
   float y = 0.0F;
   float z = 0.0F;
   M5.Imu.getMag(&x, &y, &z);
-  return compass::Vec3{x, y, z};
+  g_lastCoreMag = compass::Vec3{x, y, z};
+  return compass::stackChanFaceFrameFromCoreS3(g_lastCoreMag);
 }
 
 compass::Vec3 readAccel() {
@@ -244,126 +243,30 @@ compass::Vec3 readAccel() {
   float y = 0.0F;
   float z = 0.0F;
   M5.Imu.getAccel(&x, &y, &z);
-  return compass::Vec3{x, y, z};
+  g_lastCoreAccel = compass::Vec3{x, y, z};
+  return compass::stackChanFaceFrameFromCoreS3(g_lastCoreAccel);
 }
 
-bool waitForBmi270AuxIdle() {
-  constexpr int kMaximumPolls = 20;
-  for (int poll = 0; poll < kMaximumPolls; ++poll) {
-    const std::uint8_t status =
-        M5.In_I2C.readRegister8(kBmi270Address, kBmi270StatusRegister, kInternalI2cFrequency);
-    const bool auxiliaryWriteFinished = (status & kBmi270AuxBusyMask) == 0;
-    if (auxiliaryWriteFinished) {
-      return true;
-    }
-    delay(1);
-  }
-  return false;
-}
-
-bool restoreBmm150AutomaticRead() {
-  const bool configRestored =
-      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxInterfaceConfigRegister,
-                               kBmi270AuxAutomaticReadConfig, kInternalI2cFrequency);
-  const bool addressRestored =
-      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxReadAddressRegister,
-                               kBmm150DataStartRegister, kInternalI2cFrequency);
-  return configRestored && addressRestored;
-}
-
-bool writeBmm150AuxRegister(std::uint8_t registerAddress, std::uint8_t value) {
-  // Why not自動読出し中のまま書く: BMI270は動作モードの書込みだけ通る場合があるが、
-  // 実機ではREPXY/REPZが0のまま残った。M5Unifiedの初期化と同じ手動モードで書く。
-  const bool manualModeEntered =
-      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxInterfaceConfigRegister,
-                               kBmi270AuxManualReadConfig, kInternalI2cFrequency);
-  const bool manualModeFailed = !manualModeEntered;
-  if (manualModeFailed) {
-    restoreBmm150AutomaticRead();
-    return false;
+compass::Vec3 averageMagneticSample(compass::Vec3 sample) {
+  const bool averageWindowIsFull = g_magneticAverageCount == kMagneticAverageWindow;
+  if (averageWindowIsFull) {
+    const compass::Vec3& oldest = g_magneticAverageSamples[g_magneticAverageIndex];
+    g_magneticAverageSum.x -= oldest.x;
+    g_magneticAverageSum.y -= oldest.y;
+    g_magneticAverageSum.z -= oldest.z;
+  } else {
+    ++g_magneticAverageCount;
   }
 
-  const bool dataWritten = M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxWriteDataRegister,
-                                                    value, kInternalI2cFrequency);
-  const bool dataWriteFailed = !dataWritten;
-  if (dataWriteFailed) {
-    restoreBmm150AutomaticRead();
-    return false;
-  }
+  g_magneticAverageSamples[g_magneticAverageIndex] = sample;
+  g_magneticAverageIndex = (g_magneticAverageIndex + 1) % kMagneticAverageWindow;
+  g_magneticAverageSum.x += sample.x;
+  g_magneticAverageSum.y += sample.y;
+  g_magneticAverageSum.z += sample.z;
 
-  const bool addressWritten = M5.In_I2C.writeRegister8(
-      kBmi270Address, kBmi270AuxWriteAddressRegister, registerAddress, kInternalI2cFrequency);
-  const bool addressWriteFailed = !addressWritten;
-  if (addressWriteFailed) {
-    restoreBmm150AutomaticRead();
-    return false;
-  }
-
-  const bool writeFinished = waitForBmi270AuxIdle();
-  const bool automaticReadRestored = restoreBmm150AutomaticRead();
-  return writeFinished && automaticReadRestored;
-}
-
-bool readBmm150AuxRegister(std::uint8_t registerAddress, std::uint8_t& value) {
-  const bool manualModeEntered =
-      M5.In_I2C.writeRegister8(kBmi270Address, kBmi270AuxInterfaceConfigRegister,
-                               kBmi270AuxManualReadConfig, kInternalI2cFrequency);
-  const bool readAddressWritten = M5.In_I2C.writeRegister8(
-      kBmi270Address, kBmi270AuxReadAddressRegister, registerAddress, kInternalI2cFrequency);
-  const bool requestStarted = manualModeEntered && readAddressWritten;
-  const bool requestFinished = requestStarted && waitForBmi270AuxIdle();
-  if (requestFinished) {
-    value = M5.In_I2C.readRegister8(kBmi270Address, kBmi270AuxDataRegister, kInternalI2cFrequency);
-  }
-
-  // Why not読出し先をそのままにする: M5Unifiedは0x42から8バイトの自動読出しを
-  // 前提に磁気を取り込むので、診断後に戻さないと全測定が壊れる。
-  const bool automaticReadRestored = restoreBmm150AutomaticRead();
-  return requestFinished && automaticReadRestored;
-}
-
-bool configureMagnetometerForAccuracy() {
-  // Why notホスト側の移動平均だけに頼る: BMM150自身の反復測定なら、サンプルを
-  // 出す前にセンサー内部でノイズを平均でき、後段へ大振幅のZノイズを渡さない。
-  const bool enteredSleep =
-      writeBmm150AuxRegister(kBmm150OperationModeRegister, kBmm150SleepMode30Hz);
-  const bool sleepTransitionFailed = !enteredSleep;
-  if (sleepTransitionFailed) {
-    return false;
-  }
-  delay(1);
-
-  const bool xyConfigured =
-      writeBmm150AuxRegister(kBmm150XyRepetitionsRegister, kBmm150HighAccuracyXyRepetitions);
-  const bool xyConfigurationFailed = !xyConfigured;
-  if (xyConfigurationFailed) {
-    return false;
-  }
-
-  const bool zConfigured =
-      writeBmm150AuxRegister(kBmm150ZRepetitionsRegister, kBmm150HighAccuracyZRepetitions);
-  const bool zConfigurationFailed = !zConfigured;
-  if (zConfigurationFailed) {
-    return false;
-  }
-
-  const bool normalModeEntered =
-      writeBmm150AuxRegister(kBmm150OperationModeRegister, kBmm150NormalMode20Hz);
-  const bool normalModeTransitionFailed = !normalModeEntered;
-  if (normalModeTransitionFailed) {
-    return false;
-  }
-
-  // 高精度プリセットの1測定は約49msなので、最初の値を読む前に完了を待つ。
-  delay(50);
-
-  const bool xyRead = readBmm150AuxRegister(kBmm150XyRepetitionsRegister, g_bmm150XyRepetitions);
-  const bool zRead = readBmm150AuxRegister(kBmm150ZRepetitionsRegister, g_bmm150ZRepetitions);
-  const bool modeRead = readBmm150AuxRegister(kBmm150OperationModeRegister, g_bmm150OperationMode);
-  const bool xyMatches = g_bmm150XyRepetitions == kBmm150HighAccuracyXyRepetitions;
-  const bool zMatches = g_bmm150ZRepetitions == kBmm150HighAccuracyZRepetitions;
-  const bool modeMatches = (g_bmm150OperationMode & 0x3E) == kBmm150NormalMode20Hz;
-  return xyRead && zRead && modeRead && xyMatches && zMatches && modeMatches;
+  const float sampleCount = static_cast<float>(g_magneticAverageCount);
+  return {g_magneticAverageSum.x / sampleCount, g_magneticAverageSum.y / sampleCount,
+          g_magneticAverageSum.z / sampleCount};
 }
 
 compass::Vec3 correctedHorizontalField(compass::Vec3 magneticField, compass::Vec3 acceleration) {
@@ -377,7 +280,11 @@ float readGyroMagnitude() {
   float y = 0.0F;
   float z = 0.0F;
   M5.Imu.getGyro(&x, &y, &z);
-  return std::sqrt(x * x + y * y + z * z);
+  g_lastCoreGyro = compass::Vec3{x, y, z};
+  g_lastFaceGyro = compass::stackChanFaceFrameFromCoreS3(g_lastCoreGyro);
+  g_lastGyroMagnitude = std::sqrt(x * x + y * y + z * z);
+  g_lastGyroReadMillis = millis();
+  return g_lastGyroMagnitude;
 }
 
 bool setClockFromUnix(std::time_t unixSeconds) {
@@ -445,42 +352,6 @@ bool saveLevel(const compass::LevelCalibration& calibration) {
       written == sizeof(calibration) ? preferences.putUInt("version", kLevelStorageVersion) : 0;
   preferences.end();
   return written == sizeof(calibration) && versionWritten == sizeof(kLevelStorageVersion);
-}
-
-// 首の角度によるずれの表。学習に時間がかかるので、電源を切っても残す。
-bool saveBiasTable() {
-  Preferences preferences;
-  const bool opened = preferences.begin(kBiasNamespace, false);
-  if (!opened) {
-    return false;
-  }
-  const std::size_t written = preferences.putBytes("table", &g_biasTable, sizeof(g_biasTable));
-  // 版は本体を書き切った後に確定させる。先に版だけ更新すると、書き込み失敗時に
-  // 同じ大きさの古い表を現行データとして読む可能性がある。
-  const std::size_t versionWritten =
-      written == sizeof(g_biasTable) ? preferences.putUInt("version", kBiasStorageVersion) : 0;
-  preferences.end();
-  return written == sizeof(g_biasTable) && versionWritten == sizeof(kBiasStorageVersion);
-}
-
-void loadBiasTable() {
-  Preferences preferences;
-  const bool opened = preferences.begin(kBiasNamespace, true);
-  if (!opened) {
-    return;
-  }
-  const bool hasCurrentVersion = preferences.getUInt("version", 0) == kBiasStorageVersion;
-  compass::ServoBiasTable stored;
-  const bool hasStoredTable = preferences.getBytesLength("table") == sizeof(stored);
-  const bool canLoadStoredTable = hasCurrentVersion && hasStoredTable;
-  if (canLoadStoredTable) {
-    const std::size_t read = preferences.getBytes("table", &stored, sizeof(stored));
-    const bool readComplete = read == sizeof(stored);
-    if (readComplete) {
-      g_biasTable = stored;
-    }
-  }
-  preferences.end();
 }
 
 void loadLevel() {
@@ -675,6 +546,186 @@ void startWifi() {
   g_wifiConnected = WiFi.status() == WL_CONNECTED;
 }
 
+void sendControlStatus() {
+  std::array<char, 320> payload{};
+  std::snprintf(
+      payload.data(), payload.size(),
+      "{\"host\":\"%s.local\",\"target\":%d,\"targetName\":\"%s\","
+      "\"phase\":\"%s\",\"autoCycle\":%s,"
+      "\"calibrationMaxTiltDegrees\":%.1f,\"calibrationSamples\":%u,"
+      "\"calibrationCoverage\":%.2f}",
+      g_hostName.data(), static_cast<int>(g_state.target), astro::targetName(g_state.target),
+      app::phaseName(g_state.phase), g_state.autoCycleEnabled ? "true" : "false",
+      static_cast<double>(g_calibrationTuning.maxTiltDegrees),
+      static_cast<unsigned>(g_calibrationCount), static_cast<double>(g_calibrationCoverage));
+  g_controlServer.sendHeader("Cache-Control", "no-store");
+  g_controlServer.send(200, "application/json; charset=utf-8", payload.data());
+}
+
+void sendSensorSnapshot() {
+  const std::uint32_t now = millis();
+  const std::uint32_t magnetometerAgeMillis = g_hasRawMagSample ? now - g_lastMagChangeMillis : now;
+  const std::uint32_t gyroscopeAgeMillis =
+      g_lastGyroReadMillis > 0 ? now - g_lastGyroReadMillis : now;
+  const compass::Vec3 corrected = correctedHorizontalField(g_lastRawMag, g_lastAccel);
+  const float magneticHeading = compass::headingDegreesFromHorizontal(corrected);
+  const float actualYawDegrees = static_cast<float>(g_lastServoAngles.yawDeci) / 10.0F;
+  const float actualPitchDegrees = static_cast<float>(g_lastServoAngles.pitchDeci) / 10.0F;
+  const float neckAzimuthDegrees =
+      compass::normalizeDegrees(g_state.bodyHeadingDegrees + actualYawDegrees);
+  const double neckAltitudeDegrees = pointing::altitudeFromPitchDeci(g_lastServoAngles.pitchDeci);
+
+  std::array<char, 2048> payload{};
+  const int written = std::snprintf(
+      payload.data(), payload.size(),
+      "{\"host\":\"%s.local\",\"uptimeMillis\":%lu,\"phase\":\"%s\","
+      "\"target\":{\"index\":%d,\"azimuthDegrees\":%.2f,\"altitudeDegrees\":%.2f},"
+      "\"magnetometer\":{\"core\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
+      "\"face\":{\"xForward\":%.3f,\"yRight\":%.3f,\"zUp\":%.3f},"
+      "\"averageFace\":{\"xForward\":%.3f,\"yRight\":%.3f,\"zUp\":%.3f},"
+      "\"horizontalCorrected\":{\"xForward\":%.3f,\"yRight\":%.3f},"
+      "\"ageMillis\":%lu,\"freshSamples\":%lu,\"repeatedSamples\":%lu},"
+      "\"accelerometer\":{\"core\":{\"x\":%.4f,\"y\":%.4f,\"z\":%.4f},"
+      "\"face\":{\"xForward\":%.4f,\"yRight\":%.4f,\"zUp\":%.4f}},"
+      "\"gyroscope\":{\"core\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
+      "\"face\":{\"xForward\":%.3f,\"yRight\":%.3f,\"zUp\":%.3f},"
+      "\"magnitudeDegreesPerSecond\":%.3f,\"ageMillis\":%lu},"
+      "\"heading\":{\"valid\":%s,\"bodyTrueDegrees\":%.2f,"
+      "\"stateBodyDegrees\":%.2f,\"filteredMagneticDegrees\":%.2f,"
+      "\"instantMagneticDegrees\":%.2f,\"declinationEastDegrees\":%.2f},"
+      "\"servo\":{\"settled\":%s,\"actualYawDegrees\":%.1f,"
+      "\"actualPitchDegrees\":%.1f,\"commandedYawDegrees\":%.1f,"
+      "\"commandedPitchDegrees\":%.1f,\"neckAzimuthDegrees\":%.2f,"
+      "\"neckAltitudeDegrees\":%.2f},"
+      "\"calibration\":{\"valid\":%s,\"offsetX\":%.3f,\"offsetY\":%.3f,"
+      "\"scaleX\":%.5f,\"scaleY\":%.5f,\"crossAxis\":%.5f,"
+      "\"radius\":%.3f,\"normalizedResidual\":%.5f}}",
+      g_hostName.data(), static_cast<unsigned long>(now), app::phaseName(g_state.phase),
+      static_cast<int>(g_state.target), g_state.lastPosition.horizontal.azimuthDegrees,
+      g_state.lastPosition.horizontal.altitudeDegrees, static_cast<double>(g_lastCoreMag.x),
+      static_cast<double>(g_lastCoreMag.y), static_cast<double>(g_lastCoreMag.z),
+      static_cast<double>(g_lastSensorMag.x), static_cast<double>(g_lastSensorMag.y),
+      static_cast<double>(g_lastSensorMag.z), static_cast<double>(g_lastRawMag.x),
+      static_cast<double>(g_lastRawMag.y), static_cast<double>(g_lastRawMag.z),
+      static_cast<double>(corrected.x), static_cast<double>(corrected.y),
+      static_cast<unsigned long>(magnetometerAgeMillis),
+      static_cast<unsigned long>(g_magnetometerChangeCount),
+      static_cast<unsigned long>(g_magnetometerRepeatedCount),
+      static_cast<double>(g_lastCoreAccel.x), static_cast<double>(g_lastCoreAccel.y),
+      static_cast<double>(g_lastCoreAccel.z), static_cast<double>(g_lastObservedAccel.x),
+      static_cast<double>(g_lastObservedAccel.y), static_cast<double>(g_lastObservedAccel.z),
+      static_cast<double>(g_lastCoreGyro.x), static_cast<double>(g_lastCoreGyro.y),
+      static_cast<double>(g_lastCoreGyro.z), static_cast<double>(g_lastFaceGyro.x),
+      static_cast<double>(g_lastFaceGyro.y), static_cast<double>(g_lastFaceGyro.z),
+      static_cast<double>(g_lastGyroMagnitude), static_cast<unsigned long>(gyroscopeAgeMillis),
+      g_headingValid ? "true" : "false", static_cast<double>(g_bodyTrueHeading),
+      static_cast<double>(g_state.bodyHeadingDegrees),
+      static_cast<double>(g_headingFilter.valueDegrees()), static_cast<double>(magneticHeading),
+      static_cast<double>(kSiteDeclinationEast), g_lastTickServoSettled ? "true" : "false",
+      static_cast<double>(actualYawDegrees), static_cast<double>(actualPitchDegrees),
+      static_cast<double>(g_commandedYaw) / 10.0, static_cast<double>(g_commandedPitch) / 10.0,
+      static_cast<double>(neckAzimuthDegrees), neckAltitudeDegrees,
+      g_level.valid ? "true" : "false", static_cast<double>(g_level.offsetX),
+      static_cast<double>(g_level.offsetY), static_cast<double>(g_level.scaleX),
+      static_cast<double>(g_level.scaleY), static_cast<double>(g_level.crossAxis),
+      static_cast<double>(g_level.radius), static_cast<double>(g_level.normalizedResidual));
+  const bool payloadFits = written >= 0 && static_cast<std::size_t>(written) < payload.size();
+  if (!payloadFits) {
+    g_controlServer.send(500, "application/json", "{\"error\":\"sensor payload overflow\"}");
+    return;
+  }
+
+  g_controlServer.sendHeader("Cache-Control", "no-store");
+  g_controlServer.send(200, "application/json; charset=utf-8", payload.data());
+}
+
+void resetCalibrationSession() {
+  // 既存のNVS結果は消さない。試行が失敗しても再起動すれば以前の補正へ戻せる。
+  g_level = compass::LevelCalibration{};
+  g_calibrationCount = 0;
+  g_calibrationCoverage = 0.0F;
+  g_calibrationCandidateRadius = 0.0F;
+  g_calibrationCandidateResidual = 1.0F;
+  g_calibrationFitCount = 0;
+  g_calibrationTiltResetCount = 0;
+  g_referenceGravity = compass::Vec3{};
+  g_headingFilter.reset();
+  g_headingValid = false;
+  g_state.phase = app::Phase::Calibrating;
+  g_state.phaseEnteredMillis = millis();
+}
+
+void handleCalibrationRequest() {
+  const bool hasMaximumTilt = g_controlServer.hasArg("maxTiltDegrees");
+  if (!hasMaximumTilt) {
+    g_controlServer.send(400, "application/json", "{\"error\":\"maxTiltDegrees is required\"}");
+    return;
+  }
+
+  const String rawMaximumTilt = g_controlServer.arg("maxTiltDegrees");
+  char* parseEnd = nullptr;
+  const float parsedMaximumTilt = std::strtof(rawMaximumTilt.c_str(), &parseEnd);
+  const bool parsedEntireValue = parseEnd != rawMaximumTilt.c_str() && *parseEnd == '\0';
+  const bool valueIsFinite = std::isfinite(parsedMaximumTilt);
+  const bool valueIsInRange = parsedMaximumTilt >= 1.0F && parsedMaximumTilt <= 30.0F;
+  const bool maximumTiltIsValid = parsedEntireValue && valueIsFinite && valueIsInRange;
+  if (!maximumTiltIsValid) {
+    g_controlServer.send(400, "application/json", "{\"error\":\"maxTiltDegrees must be 1..30\"}");
+    return;
+  }
+
+  constexpr float kPi = 3.14159265358979323846F;
+  g_calibrationTuning.maxTiltDegrees = parsedMaximumTilt;
+  g_calibrationTuning.minimumGravityDot = std::cos(parsedMaximumTilt * kPi / 180.0F);
+  resetCalibrationSession();
+
+  std::array<char, 96> payload{};
+  std::snprintf(payload.data(), payload.size(),
+                "{\"accepted\":true,\"maxTiltDegrees\":%.1f,\"samples\":0}",
+                static_cast<double>(g_calibrationTuning.maxTiltDegrees));
+  g_controlServer.sendHeader("Cache-Control", "no-store");
+  g_controlServer.send(202, "application/json; charset=utf-8", payload.data());
+}
+
+void handleTargetRequest() {
+  const bool hasTarget = g_controlServer.hasArg("target");
+  if (!hasTarget) {
+    g_controlServer.send(400, "application/json", "{\"error\":\"target is required\"}");
+    return;
+  }
+
+  const String targetValue = g_controlServer.arg("target");
+  char* parseEnd = nullptr;
+  const long parsedTarget = std::strtol(targetValue.c_str(), &parseEnd, 10);
+  const bool parsedEntireValue = parseEnd != targetValue.c_str() && *parseEnd == '\0';
+  const bool targetIsInRange = parsedTarget >= 0 && parsedTarget < kTargetCount;
+  if (!parsedEntireValue || !targetIsInRange) {
+    g_controlServer.send(400, "application/json", "{\"error\":\"target must be 0..7\"}");
+    return;
+  }
+
+  g_requestedTarget.store(static_cast<int>(parsedTarget));
+  std::array<char, 48> payload{};
+  std::snprintf(payload.data(), payload.size(), "{\"accepted\":true,\"target\":%ld}", parsedTarget);
+  g_controlServer.sendHeader("Cache-Control", "no-store");
+  g_controlServer.send(202, "application/json", payload.data());
+}
+
+void startControlServer() {
+  if (g_controlServerStarted) {
+    return;
+  }
+
+  g_controlServer.on("/api/status", HTTP_GET, sendControlStatus);
+  g_controlServer.on("/api/sensors", HTTP_GET, sendSensorSnapshot);
+  g_controlServer.on("/api/calibration", HTTP_POST, handleCalibrationRequest);
+  g_controlServer.on("/api/target", HTTP_POST, handleTargetRequest);
+  g_controlServer.onNotFound(
+      []() { g_controlServer.send(404, "application/json", "{\"error\":\"not found\"}"); });
+  g_controlServer.begin();
+  g_controlServerStarted = true;
+}
+
 bool configureNtpSynchronization() {
   const bool wifiIsConnected = WiFi.status() == WL_CONNECTED;
   if (!wifiIsConnected) {
@@ -767,6 +818,9 @@ void serviceConnectivity(std::uint32_t nowMillis) {
     return;
   }
 
+  startControlServer();
+  g_controlServer.handleClient();
+
   const bool mdnsRetryDue =
       !g_mdnsAttempted || nowMillis - g_lastMdnsAttemptMillis >= kNetworkRetryMillis;
   const bool shouldStartMdns = !g_mdnsStarted && mdnsRetryDue;
@@ -778,6 +832,11 @@ void serviceConnectivity(std::uint32_t nowMillis) {
     g_mdnsAttempted = true;
     g_lastMdnsAttemptMillis = nowMillis;
     g_mdnsStarted = MDNS.begin(g_hostName.data());
+    if (g_mdnsStarted) {
+      MDNS.addService("stackchan", "tcp", kControlHttpPort);
+      MDNS.addServiceTxt("stackchan", "tcp", "path", "/api/target");
+      MDNS.addServiceTxt("stackchan", "tcp", "calibration", "/api/calibration");
+    }
   }
 
   const bool shouldConfigureNtp = !g_ntpConfigured;
@@ -845,6 +904,7 @@ ServoAngles currentServoAngles(std::uint32_t nowMillis) {
     cached.yawDeci = angles.x;
     cached.pitchDeci = angles.y;
   }
+  g_lastServoAngles = cached;
   return cached;
 }
 
@@ -1009,6 +1069,17 @@ app::Input readInput() {
   return app::Input::None;
 }
 
+void readNetworkTargetSelection(app::Tick& tick) {
+  const int requestedTarget = g_requestedTarget.exchange(-1);
+  const bool targetIsInRange = requestedTarget >= 0 && requestedTarget < kTargetCount;
+  if (!targetIsInRange) {
+    return;
+  }
+
+  tick.targetSelectionRequested = true;
+  tick.requestedTarget = static_cast<astro::Target>(requestedTarget);
+}
+
 // 磁気を 1 サンプル取り込む。
 //
 // 首が正面にないときの値はフィルタに入れない。ゲートは「採用するか」しか
@@ -1023,11 +1094,38 @@ void updateHeading(const ServoAngles& actual, std::uint32_t nowMillis, bool serv
     return;
   }
 
-  const compass::Vec3 raw = readMag();
+  const compass::Vec3 sensorRaw = readMag();
   const compass::Vec3 accel = readAccel();
+  g_lastObservedAccel = accel;
+  const bool rawMagMatchesPrevious = g_hasRawMagSample && sensorRaw.x == g_lastSensorMag.x &&
+                                     sensorRaw.y == g_lastSensorMag.y &&
+                                     sensorRaw.z == g_lastSensorMag.z;
+  if (rawMagMatchesPrevious) {
+    ++g_magnetometerRepeatedCount;
+    return;
+  }
+
+  g_hasRawMagSample = true;
+  g_lastSensorMag = sensorRaw;
+  const compass::Vec3 raw = averageMagneticSample(sensorRaw);
   g_lastRawMag = raw;
   g_lastAccel = accel;
+  g_lastMagChangeMillis = nowMillis;
+  ++g_magnetometerChangeCount;
   if (g_state.phase == app::Phase::Calibrating) {
+    // サーボの動作中と停止直後は、顔側IMUのジャイロも磁気も動く。ジャイロの
+    // 回転判定より先に棄却し、本体を回した動きだけを校正へ入れる。
+    if (!servoInertiaSettled) {
+      return;
+    }
+
+    const float rotationRateDegreesPerSecond = readGyroMagnitude();
+    const bool bodyIsRotating =
+        rotationRateDegreesPerSecond >= kCalibrationMinimumRotationRateDegreesPerSecond;
+    if (!bodyIsRotating) {
+      return;
+    }
+
     // 姿勢が変わっていないサンプルだけを採る。
     //
     // Why not 水平 (accel.z がほぼ 1g) を要求する: スタックチャンの CoreS3 は
@@ -1055,22 +1153,37 @@ void updateHeading(const ServoAngles& actual, std::uint32_t nowMillis, bool serv
     // 倒れた姿勢を区別できず、別の回転面を同じ円へ混ぜてしまう。
     const float gravityDot = gravity.x * g_referenceGravity.x + gravity.y * g_referenceGravity.y +
                              gravity.z * g_referenceGravity.z;
-    constexpr float kCosOneDegree = 0.9998477F;
-    const bool attitudeHeld = gravityDot >= kCosOneDegree;
+    const bool attitudeHeld = gravityDot >= g_calibrationTuning.minimumGravityDot;
     if (!attitudeHeld) {
-      // Why not 不一致点だけ捨てる: 起動直後に持ち上げた1点が基準になると、机へ
-      // 置いた後の全点が不一致になり、最小24点へ永久に届かない。集合ごと捨て、
-      // 次周期の静止姿勢を新しい回転面として採り直す。
-      g_calibrationCount = 0;
-      g_calibrationCoverage = 0.0F;
+      // 回転中にケーブルをまたぐ程度の一時的な傾きでは、それまで集めた円周を
+      // 失わない。不一致点だけを捨て、円への当てはまりで集合全体を最終判定する。
+      // Why not 集合を全消去: 実機では一周中に100回以上の小さな傾きが入り、
+      // 毎回消すと回し終えても静止位置の4点しか残らなかった。
+      ++g_calibrationTiltResetCount;
       return;
     }
+
+    const compass::Attitude attitude = compass::attitudeFromAccel(accel);
+    const compass::Vec3 horizontal = compass::horizontalMagneticComponents(raw, attitude);
+    bool pointIsDistinct = true;
+    for (std::size_t index = 0; index < g_calibrationCount; ++index) {
+      const compass::Vec3& existing = g_calibrationSamples[index];
+      const float distance = std::hypot(horizontal.x - existing.x, horizontal.y - existing.y);
+      const bool pointIsNearExisting =
+          distance < g_calibrationTuning.minimumPointDistanceMicroTesla;
+      if (pointIsNearExisting) {
+        pointIsDistinct = false;
+        break;
+      }
+    }
+    if (!pointIsDistinct) {
+      return;
+    }
+
     const bool hasSampleStorage = g_calibrationSamples != nullptr;
     const bool hasSampleCapacity = g_calibrationCount < kCalibrationCapacity;
     if (hasSampleStorage && hasSampleCapacity) {
-      const compass::Attitude attitude = compass::attitudeFromAccel(accel);
-      g_calibrationSamples[g_calibrationCount++] =
-          compass::horizontalMagneticComponents(raw, attitude);
+      g_calibrationSamples[g_calibrationCount++] = horizontal;
     }
     return;
   }
@@ -1081,64 +1194,25 @@ void updateHeading(const ServoAngles& actual, std::uint32_t nowMillis, bool serv
     return;
   }
 
-  const int yawDeci = actual.yawDeci;
-
   const compass::Vec3 corrected = correctedHorizontalField(raw, accel);
   const float measured = compass::headingDegreesFromHorizontal(corrected);
 
-  const bool atMeasurePose = compass::isMeasurementPose(yawDeci);
-
-  // 首が正面なら、その値がそのまま機体の方位。バイアス表の基準にもなる。
-  if (atMeasurePose) {
-    g_headingFilter.update(measured);
-    if (g_headingFilter.hasConverged(8)) {
-      g_measurePoseHeading = g_headingFilter.valueDegrees();
-      g_measurePoseHeadingMillis = nowMillis;
-      g_hasMeasurePoseHeading = true;
-    }
+  // 横向きではyaw角だけでなくpitchと磁場強度まで変わる。実測モデルなしに
+  // 補間せず、同じ正面・水平姿勢で採ったサンプルだけを平均する。
+  const bool atMeasurePose = compass::isMeasurementPose(actual.yawDeci);
+  if (!atMeasurePose) {
     return;
   }
-
-  // 首が横を向いている。まず、覚えられる状況なら覚える。
-  //
-  // Why not 覚え終わったら学習をやめる: 首の角度ごとのずれは 1 回の観測では
-  // 決まらないし、置き方でも変わる。使いながら測り続けて精度を上げる。
-  // 表が育つほど、指したままでも正しい方位が読めるようになる。
-  const bool basisIsFresh =
-      g_hasMeasurePoseHeading && nowMillis - g_measurePoseHeadingMillis < kBiasBasisValidMillis;
-  const bool bodyStill = readGyroMagnitude() < g_config.bodyMovedGyroDegPerSec;
-  const bool canLearnBias = basisIsFresh && bodyStill;
-  if (canLearnBias) {
-    const bool shouldPersistObservation = g_biasTable.observe(
-        yawDeci, compass::signedAngleDifference(measured, g_measurePoseHeading));
-    g_biasDirty = g_biasDirty || shouldPersistObservation;
-  }
-
-  // その角度を実際に覚えていれば補正して使う。持ち歩きながら指し続けるには、
-  // 指した姿勢のままでも方位を追い続ける必要がある。
-  //
-  // Why not 隣のビンの値を借りる: 実機で試したところ、未学習の角度に首が
-  // 向いた瞬間に方位が 270 度飛んだ。誤差は角度に比例して増えるので、
-  // 借り物では足りない。覚えていない角度では素直に諦める。
-  const bool hasLearnedBias = g_biasTable.hasObservationFor(yawDeci);
-  if (hasLearnedBias) {
-    const float correction = g_biasTable.correctionDegrees(yawDeci);
-    g_headingFilter.update(compass::normalizeDegrees(measured - correction));
-    // 学習済みの角度も補正後は機体方位の基準になる。ここを更新しないと、
-    // A(学習済み)→B(未学習)の巡回でBへ渡す新鮮な基準がなく、同じ順では
-    // Bが永久に未学習のまま残る。
-    if (g_headingFilter.hasConverged(8)) {
-      g_measurePoseHeading = g_headingFilter.valueDegrees();
-      g_measurePoseHeadingMillis = nowMillis;
-      g_hasMeasurePoseHeading = true;
-    }
-  }
+  g_headingFilter.update(measured);
 }
 
 // キャリブレーションの完了判定。当てはめが重いので間隔を空けて呼ぶこと。
 void tryFinishCalibration() {
   const compass::LevelCalibration calibration =
       compass::fitLevelCircle(g_calibrationSamples, g_calibrationCount);
+  ++g_calibrationFitCount;
+  g_calibrationCandidateRadius = calibration.radius;
+  g_calibrationCandidateResidual = calibration.normalizedResidual;
   g_calibrationCoverage = calibration.valid
                               ? 1.0F
                               : compass::angularCoverage(g_calibrationSamples, g_calibrationCount,
@@ -1217,7 +1291,8 @@ void setup() {
   g_bootResetReason = esp_reset_reason();
   auto config = M5.config();
   M5.begin(config);
-  g_magnetometerHighAccuracy = configureMagnetometerForAccuracy();
+  // Why not BMI270のAUX経由でBMM150を再設定する: 実機で手動書込み後に
+  // 連続読出しが止まった。M5Unifiedの初期化を保ち、ノイズはRAM上で平均する。
   // 動作中の状態を読む唯一の手段。NVS はフラッシュ読み出しに esptool のリセットを
   // 伴うので、何度読んでも「起動直後」しか観測できず、指した結果が見えない。
   Serial.begin(115200);
@@ -1242,7 +1317,6 @@ void setup() {
   }
 
   loadLevel();
-  loadBiasTable();
   syncTime();
 
   // 顔。以後 M5.Display へ直接書かない (Avatar が自前のスレッドで描くため)。
@@ -1299,7 +1373,6 @@ void loop() {
   gateInput.fieldMagnitudeMicroTesla = compass::magnitude(gateField);
   gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
   gateInput.yawDeciDegrees = actualYaw;
-  gateInput.biasCorrected = g_biasTable.hasObservationFor(actualYaw);
 
   // 停止した瞬間を 1 回だけ記録する。ここへ来るまでに慣性待ちを済ませているので、
   // その待ち時間を差し引き、ゲート側で同じ待ちを重ねない。
@@ -1336,6 +1409,7 @@ void loop() {
   tick.timeValid = g_timeValid;
   tick.calibrationValid = g_level.valid;
   tick.input = readInput();
+  readNetworkTargetSelection(tick);
   tick.bodyTrueHeadingDegrees = g_bodyTrueHeading;
   tick.headingValid = g_headingValid;
   tick.measurementAccepted = measurementAccepted;
@@ -1344,22 +1418,16 @@ void loop() {
   // State側も同じ慣性待ちを単体で保証できるよう、ここでは元のサーボ静止だけを渡す。
   // ジャイロ値自体はservoInertiaSettledまで読まないため、二重に待つことはない。
   tick.servoSettled = !servoMoving;
-  tick.biasCorrected = g_biasTable.hasObservationFor(actualYaw);
   g_lastTickServoSettled = servoInertiaSettled;
 
   app::step(g_state, tick, g_config, g_observer);
-  applyServoIntent(app::servoIntentFor(g_state), actual);
-
-  // 新しい区画を覚えたときだけ、サーボが静かな周期にまとめて保存する。
-  // 観測ごとに書くとフラッシュを摩耗させ、実機では応答停止も起きた。
-  static std::uint32_t lastBiasSaveMillis = 0;
-  const bool biasSaveDue =
-      g_biasDirty && servoInertiaSettled && now - lastBiasSaveMillis >= kBiasSaveIntervalMillis;
-  const bool biasSaved = biasSaveDue && saveBiasTable();
-  if (biasSaved) {
-    lastBiasSaveMillis = now;
-    g_biasDirty = false;
+  if (g_state.headingResetRequested) {
+    // 本体の方位が変わったため、移動中まで含む古い平均を破棄する。
+    // 次の正面・水平測定が8サンプル収束するまで旧方位を再利用しない。
+    g_headingFilter.reset();
+    g_headingValid = false;
   }
+  applyServoIntent(app::servoIntentFor(g_state), actual);
 
   // 進捗をホストから確認するための最小限の記録。
   //
@@ -1425,12 +1493,13 @@ void loop() {
     Serial.printf(
         "phase=%s up=%lu rst=%d target=%d rej=%d hdgOk=%d hdg=%.1f yaw=%d pitch=%d "
         "cmdYaw=%d cmdPitch=%d neckAbs=%.1f neckAlt=%.1f tgtAz=%.1f alt=%.1f "
-        "eph=%s clampY=%d clampP=%d timeOk=%d touchN=%d calN=%u nS=%u "
+        "eph=%s clampY=%d clampP=%d timeOk=%d touchN=%d calN=%u calCov=%.2f "
+        "calRad=%.1f calErr=%.3f calFit=%lu calTilt=%lu calMax=%.1f nS=%u "
         "mean=%.1f disp=%.1f field=%.1f ref=%.1f mx=%.1f my=%.1f mz=%.1f "
         "ax=%.3f ay=%.3f az=%.3f ox=%.1f oy=%.1f sx=%.3f sy=%.3f cx=%.3f "
-        "rad=%.1f err=%.3f magAcc=%d repXY=%u repZ=%u magMode=%u "
-        "wifi=%d mdns=%d ntp=%d host=%s loc=%s lat=%.4f lon=%.4f "
-        "settled=%d tI=%03d tSeen=%d bias=%u\n",
+        "rad=%.1f err=%.3f magAvg=%u magAge=%lu magFreshN=%lu magRepeatN=%lu "
+        "wifi=%d mdns=%d api=%d ntp=%d host=%s loc=%s lat=%.4f lon=%.4f "
+        "settled=%d gyro=%.1f motionN=%lu force=%d tI=%03d tSeen=%d\n",
         app::phaseName(g_state.phase), static_cast<unsigned long>(now),
         static_cast<int>(g_bootResetReason), static_cast<int>(g_state.target),
         static_cast<int>(g_state.lastReject), g_headingValid ? 1 : 0,
@@ -1441,24 +1510,33 @@ void loop() {
         astro::ephemerisSourceName(g_state.lastPosition.source),
         g_state.lastSolve.command.clampedYaw ? 1 : 0,
         g_state.lastSolve.command.clampedPitch ? 1 : 0, g_timeValid ? 1 : 0, g_touchEventCount,
-        static_cast<unsigned>(g_calibrationCount),
+        static_cast<unsigned>(g_calibrationCount), static_cast<double>(g_calibrationCoverage),
+        static_cast<double>(g_calibrationCandidateRadius),
+        static_cast<double>(g_calibrationCandidateResidual),
+        static_cast<unsigned long>(g_calibrationFitCount),
+        static_cast<unsigned long>(g_calibrationTiltResetCount),
+        static_cast<double>(g_calibrationTuning.maxTiltDegrees),
         static_cast<unsigned>(g_headingFilter.sampleCount()),
         static_cast<double>(g_headingFilter.valueDegrees()),
         static_cast<double>(g_headingFilter.dispersionDegrees()),
         static_cast<double>(gateInput.fieldMagnitudeMicroTesla),
         static_cast<double>(g_gate.referenceFieldMicroTesla()), static_cast<double>(g_lastRawMag.x),
         static_cast<double>(g_lastRawMag.y), static_cast<double>(g_lastRawMag.z),
-        static_cast<double>(g_lastAccel.x), static_cast<double>(g_lastAccel.y),
-        static_cast<double>(g_lastAccel.z), static_cast<double>(g_level.offsetX),
+        static_cast<double>(g_lastObservedAccel.x), static_cast<double>(g_lastObservedAccel.y),
+        static_cast<double>(g_lastObservedAccel.z), static_cast<double>(g_level.offsetX),
         static_cast<double>(g_level.offsetY), static_cast<double>(g_level.scaleX),
         static_cast<double>(g_level.scaleY), static_cast<double>(g_level.crossAxis),
         static_cast<double>(g_level.radius), static_cast<double>(g_level.normalizedResidual),
-        g_magnetometerHighAccuracy ? 1 : 0, static_cast<unsigned>(g_bmm150XyRepetitions),
-        static_cast<unsigned>(g_bmm150ZRepetitions), static_cast<unsigned>(g_bmm150OperationMode),
-        g_wifiConnected ? 1 : 0, g_wifiConnected && g_mdnsStarted ? 1 : 0,
+        static_cast<unsigned>(kMagneticAverageWindow),
+        static_cast<unsigned long>(g_hasRawMagSample ? now - g_lastMagChangeMillis : now),
+        static_cast<unsigned long>(g_magnetometerChangeCount),
+        static_cast<unsigned long>(g_magnetometerRepeatedCount), g_wifiConnected ? 1 : 0,
+        g_wifiConnected && g_mdnsStarted ? 1 : 0, g_wifiConnected && g_controlServerStarted ? 1 : 0,
         g_ntpSynchronized ? 1 : 0, g_hostName.data(), locationSourceName(g_locationSource),
         g_observer.latitudeDegrees, g_observer.longitudeEastDegrees, g_lastTickServoSettled ? 1 : 0,
-        g_touchIntensity, g_touchSeenCount, static_cast<unsigned>(g_biasTable.populatedBinCount()));
+        static_cast<double>(gateInput.gyroMagnitudeDegPerSec),
+        static_cast<unsigned long>(g_state.bodyMotionCount), g_state.forceMeasurementPose ? 1 : 0,
+        g_touchIntensity, g_touchSeenCount);
   }
 
   static std::uint32_t lastDraw = 0;

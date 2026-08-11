@@ -24,12 +24,12 @@ constexpr float kHardIronY = 145.0F;
 constexpr float kHardIronZ = 340.0F;
 
 // 本体を水平に回したときに観測される磁気。
-// 機体が heading を向いているとき、機体座標では地磁気が逆向きに回って見える。
+// K151実機の顔座標では、時計回りの方位増加に対して水平Yが正へ回る。
 compass::Vec3 sampleAtHeading(float headingDegrees, float scaleX, float scaleY) {
   const float radians = headingDegrees * kPi / 180.0F;
   compass::Vec3 sample;
   sample.x = kHardIronX + kHorizontalField * std::cos(radians) / scaleX;
-  sample.y = kHardIronY - kHorizontalField * std::sin(radians) / scaleY;
+  sample.y = kHardIronY + kHorizontalField * std::sin(radians) / scaleY;
   sample.z = kHardIronZ + kVerticalField;
   return sample;
 }
@@ -53,7 +53,7 @@ compass::Vec3 tiltedRawSample(float headingDegrees, compass::Attitude attitude) 
 
   // heading.cppの水平化行列の転置で、水平座標の地磁気を機体座標へ戻す。
   const float horizontalX = kHorizontalField * std::cos(heading);
-  const float horizontalY = -kHorizontalField * std::sin(heading);
+  const float horizontalY = kHorizontalField * std::sin(heading);
   const float vertical = kVerticalField;
 
   compass::Vec3 raw;
@@ -76,7 +76,7 @@ compass::Vec3 rotatedEllipseSample(float headingDegrees) {
   const float inverseYY = sine * sine / kMajorCorrection + cosine * cosine / kMinorCorrection;
   const float heading = headingDegrees * kPi / 180.0F;
   const float idealX = kHorizontalField * std::cos(heading);
-  const float idealY = -kHorizontalField * std::sin(heading);
+  const float idealY = kHorizontalField * std::sin(heading);
   return compass::Vec3{kHardIronX + inverseXX * idealX + inverseXY * idealY,
                        kHardIronY + inverseXY * idealX + inverseYY * idealY, kHardIronZ};
 }

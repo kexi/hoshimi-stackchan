@@ -34,8 +34,6 @@ app::Tick tickAt(std::uint32_t nowMillis) {
   tick.headingValid = true;
   tick.measurementAccepted = true;
   tick.servoSettled = true;
-  // 現在の首角度を補正できる定常状態で見る。
-  tick.biasCorrected = true;
   return tick;
 }
 
@@ -141,19 +139,12 @@ void testBackwardSwipeReversesOrder() {
   CHECK_TRUE(state.target == astro::Target::Saturn);
 }
 
-void testTapTogglesAutoCycleAndItAdvances() {
-  // タップで自動巡回が始まり、放っておいてもターゲットが進むこと。
-  // 実機でスワイプが効かない場合の代替手段でもある。
+void testAutoCycleStartsEnabledAndTapStopsIt() {
+  // 起動後は自動巡回し、タップ後は対象を固定できること。
   app::State state;
   app::Config config;
   std::uint32_t clock = 0;
   CHECK_TRUE(advanceTo(state, app::Phase::Tracking, clock, config));
-  CHECK_TRUE(!state.autoCycleEnabled);
-
-  clock += 200;
-  app::Tick tap = tickAt(clock);
-  tap.input = app::Input::Click;
-  app::step(state, tap, config, tokyoObserver());
   CHECK_TRUE(state.autoCycleEnabled);
 
   // 巡回間隔を超えて進めると、ターゲットが自動で変わる
@@ -164,6 +155,19 @@ void testTapTogglesAutoCycleAndItAdvances() {
   }
   CHECK_TRUE(state.target != before);
   CHECK_TRUE(state.autoCycleEnabled);
+
+  clock += 200;
+  app::Tick tap = tickAt(clock);
+  tap.input = app::Input::Click;
+  app::step(state, tap, config, tokyoObserver());
+  CHECK_TRUE(!state.autoCycleEnabled);
+
+  const astro::Target stoppedAt = state.target;
+  for (int step = 0; step < 200; ++step) {
+    clock += 200;
+    app::step(state, tickAt(clock), config, tokyoObserver());
+  }
+  CHECK_TRUE(state.target == stoppedAt);
 }
 
 void testEveryTargetProducesReachableCommand() {
@@ -188,7 +192,7 @@ int main() {
   testSwipeCyclesThroughAllTargets();
   testNeckPointsAtEachTarget();
   testBackwardSwipeReversesOrder();
-  testTapTogglesAutoCycleAndItAdvances();
+  testAutoCycleStartsEnabledAndTapStopsIt();
   testEveryTargetProducesReachableCommand();
   return testing::summarize("target-switch");
 }

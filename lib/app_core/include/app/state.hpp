@@ -59,7 +59,9 @@ struct Config {
   // 短いと、まだ空のフィルタを見て「測れなかった」と判断してしまう。
   std::uint32_t measureTimeoutMillis = 8000;
   // 機体が動かされたと判断するジャイロのしきい値。
-  float bodyMovedGyroDegPerSec = 30.0F;
+  // 測定ゲートの3deg/sより少しだけ高くし、静止ノイズは避けつつ、土台を
+  // ゆっくり回した場合も古い方位を保持し続けないようにする。
+  float bodyMovedGyroDegPerSec = 5.0F;
   // サーボ静止後、機体移動の判定へジャイロを使わない時間。
   //
   // 位置が止まっても顔側のIMUには慣性振動が残る。実機側の位置静穏判定
@@ -74,6 +76,9 @@ struct Tick {
   bool timeValid = false;
   bool calibrationValid = false;
   Input input = Input::None;
+  // HTTPなど、順送りではなく対象を直接選ぶ入力。
+  bool targetSelectionRequested = false;
+  astro::Target requestedTarget = astro::Target::North;
 
   // 直近に採用された方位 (真方位)。headingValid が false なら未取得。
   float bodyTrueHeadingDegrees = 0.0F;
@@ -85,18 +90,13 @@ struct Tick {
 
   float gyroMagnitudeDegPerSec = 0.0F;
   bool servoSettled = true;
-
-  // いま首が向いている角度のずれを覚えているか。
-  //
-  // 真なら首を正面へ戻さずに測れるので、指したまま追尾を続けられる。
-  // 持ち歩きながら観測するにはこれが要る。覚えていない角度では戻す。
-  bool biasCorrected = false;
 };
 
 struct State {
   Phase phase = Phase::InitHardware;
   astro::Target target = astro::Target::North;
-  bool autoCycleEnabled = false;
+  // 起動後は天体を自動巡回し、明示選択やスワイプ時だけ停止する。
+  bool autoCycleEnabled = true;
 
   std::uint32_t phaseEnteredMillis = 0;
   std::uint32_t lastMeasureMillis = 0;
@@ -118,9 +118,12 @@ struct State {
   float bodyHeadingDegrees = 0.0F;
   bool hasHeading = false;
 
-  // 首の角度によるずれを補正できるか。tick から写して持つ。
-  // servoIntentFor() は State しか見ないので、ここに置く必要がある。
-  bool biasCorrected = false;
+  // 本体移動後は正面・水平で方位を取り直す。古い方位を使うと天体を追えない。
+  bool forceMeasurementPose = false;
+  // ファーム側の磁気フィルタを同じ周期で破棄するための1 tickパルス。
+  bool headingResetRequested = false;
+  // 本体移動が実際に検出された回数。シリアル診断で取りこぼしを判別する。
+  std::uint32_t bodyMotionCount = 0;
 
   compass::MeasurementGate::Reject lastReject = compass::MeasurementGate::Reject::None;
 };

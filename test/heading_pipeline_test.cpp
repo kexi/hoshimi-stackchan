@@ -116,7 +116,7 @@ compass::Vec3 fieldForHeading(float headingDegrees) {
   const float radians = headingDegrees * kPi / 180.0F;
   compass::Vec3 field;
   field.x = kFieldStrength * std::cos(kInclination) * std::cos(radians);
-  field.y = -kFieldStrength * std::cos(kInclination) * std::sin(radians);
+  field.y = kFieldStrength * std::cos(kInclination) * std::sin(radians);
   field.z = kFieldStrength * std::sin(kInclination);
   return field;
 }

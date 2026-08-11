@@ -39,6 +39,15 @@ void solveForTarget(State& state, const Tick& tick, const astro::Observer& obser
 
 // スワイプ・クリックを処理する。ターゲットが変わったら true。
 bool applyInput(State& state, const Tick& tick) {
+  if (tick.targetSelectionRequested) {
+    const bool targetChanged = state.target != tick.requestedTarget;
+    state.target = tick.requestedTarget;
+    state.lastTargetSwitchMillis = tick.nowMillis;
+    // 明示的に選んだ対象を、直後の自動巡回で上書きしない。
+    state.autoCycleEnabled = false;
+    return targetChanged;
+  }
+
   if (tick.input == Input::Click) {
     state.autoCycleEnabled = !state.autoCycleEnabled;
     state.lastTargetSwitchMillis = tick.nowMillis;
@@ -89,16 +98,14 @@ const char* phaseName(Phase phase) {
 ServoIntent servoIntentFor(const State& state) {
   ServoIntent intent;
 
-  // 測定に関わる局面では、首を必ず正面へ。これがノイズ対策の本体。
+  // 測定に関わる局面では、首を必ず正面へ。キャリブレーション中も同じ姿勢で
+  // 固定し、本体だけを回した水平円を集める。
   //
-  // ただしバイアス表が学習済みなら、首の角度によるずれは打ち消せるので
-  // 戻す必要がない。持ち歩きながら指し続けるにはこれが要る。
-  // キャリブレーション中は表の有無によらず正面で固定する (回転する円を
-  // 描くのに首が動いていると条件が変わってしまう)。
-  const bool measuringWithoutBias =
-      !state.biasCorrected &&
-      (state.phase == Phase::ReturningToMeasurePose || state.phase == Phase::Measuring);
-  const bool needsMeasurePose = measuringWithoutBias || state.phase == Phase::Calibrating;
+  // Why not 学習済みのyaw補正を使う: 横向きではpitchとサーボ磁気の影響で磁場
+  // 強度まで変わるため、角度差だけの補正では正しい方位を復元できない。
+  const bool isMeasurementPhase =
+      state.phase == Phase::ReturningToMeasurePose || state.phase == Phase::Measuring;
+  const bool needsMeasurePose = isMeasurementPhase || state.phase == Phase::Calibrating;
   if (needsMeasurePose) {
     intent.yawDeciDegrees = compass::kMeasurementYawDeci;
     intent.pitchDeciDegrees = pointing::kPitchLevelDeci;
@@ -106,10 +113,7 @@ ServoIntent servoIntentFor(const State& state) {
     return intent;
   }
 
-  // バイアス表があるなら測定中も指したままでよいので、その局面も含める。
-  const bool canPoint = state.phase == Phase::Pointing || state.phase == Phase::Tracking ||
-                        (state.biasCorrected && (state.phase == Phase::Measuring ||
-                                                 state.phase == Phase::ReturningToMeasurePose));
+  const bool canPoint = state.phase == Phase::Pointing || state.phase == Phase::Tracking;
   if (!canPoint || !state.hasSolve) {
     return intent;
   }
@@ -139,8 +143,8 @@ astro::Target previousTarget(astro::Target current) {
 }
 
 void step(State& state, const Tick& tick, const Config& config, const astro::Observer& observer) {
+  state.headingResetRequested = false;
   state.lastReject = tick.lastReject;
-  state.biasCorrected = tick.biasCorrected;
 
   // どの局面で首が動いても、静止後の慣性待ちをTrackingへ引き継ぐ。
   const bool servoIsMoving = !tick.servoSettled;
@@ -190,13 +194,6 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     return;
 
   case Phase::ReturningToMeasurePose: {
-    // バイアス表があるなら首を戻す必要がない。待たずに測りに行く。
-    // 持ち歩きながら指し続けるには、ここで足を止めていられない。
-    if (state.biasCorrected) {
-      enterPhase(state, Phase::Measuring, tick.nowMillis);
-      return;
-    }
-
     // 首が正面に戻り、磁場が落ち着くまで待つ。ここを省くと首の角度による
     // バイアス (実測で最大 119 度) がそのまま方位に乗る。
     const bool settled =
@@ -212,6 +209,7 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
       state.bodyHeadingDegrees = tick.bodyTrueHeadingDegrees;
       state.hasHeading = true;
       state.lastMeasureMillis = tick.nowMillis;
+      state.forceMeasurementPose = false;
       solveForTarget(state, tick, observer);
       enterPhase(state, Phase::Pointing, tick.nowMillis);
       return;
@@ -262,9 +260,8 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
 
     // 機体ごと動かされたら方位が変わっているので測り直す。
     //
-    // バイアス表があるなら戻らない。首を振ったままでも方位が読めるので、
-    // 追尾に留まったまま更新できる。持ち歩いている間は常に動いているので、
-    // ここで測定へ戻すと指すことも測ることもできなくなる。
+    // 本体移動を検出したら基準姿勢で取り直す。古い機体方位のままでは
+    // 惑星や月の絶対方位を保てない。
     // CoreS3のIMUは顔側にあるので、首を動かすだけでもジャイロは反応する。
     // サーボが静定し、さらに慣性振動が収まった周期だけを、本体が
     // 持ち上げられた可能性として扱う。
@@ -276,14 +273,21 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
         tick.servoSettled && elapsedSince(tick.nowMillis, state.lastServoMotionMillis) >=
                                  config.gyroAfterServoSettleMillis;
     const bool bodyMoved = servoInertiaSettled && gyroShowsMovement;
-    if (bodyMoved && !state.biasCorrected) {
+    if (bodyMoved) {
+      state.hasHeading = false;
+      state.hasSolve = false;
+      state.forceMeasurementPose = true;
+      state.headingResetRequested = true;
+      ++state.bodyMotionCount;
       enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
     }
 
-    const bool shouldCycle =
-        state.autoCycleEnabled && elapsedSince(tick.nowMillis, state.lastTargetSwitchMillis) >=
-                                      config.autoCycleIntervalMillis;
+    const bool cycleHasElapsed = elapsedSince(tick.nowMillis, state.lastTargetSwitchMillis) >=
+                                 config.autoCycleIntervalMillis;
+    // Why not 時刻無効でも進める: 真北以外は天体位置を解けず、自動で
+    // 「指す先なし」へ移行するとNTP失敗時に真北さえ指さなくなる。
+    const bool shouldCycle = state.autoCycleEnabled && tick.timeValid && cycleHasElapsed;
     if (shouldCycle) {
       state.target = nextTarget(state.target);
       state.lastTargetSwitchMillis = tick.nowMillis;
@@ -296,13 +300,6 @@ void step(State& state, const Tick& tick, const Config& config, const astro::Obs
     if (shouldRemeasure) {
       enterPhase(state, Phase::ReturningToMeasurePose, tick.nowMillis);
       return;
-    }
-
-    // バイアス表があるなら、追尾しながら方位も更新し続ける。
-    // 持ち歩いて向きが変わっても、首が指し続けるために要る。
-    if (state.biasCorrected && tick.headingValid) {
-      state.bodyHeadingDegrees = tick.bodyTrueHeadingDegrees;
-      state.lastMeasureMillis = tick.nowMillis;
     }
 
     // 天体は動き続けるので、方位はそのままでも指令を更新する。

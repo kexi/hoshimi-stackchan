@@ -15,7 +15,7 @@ import tempfile
 
 # partitions.csv の nvs エントリと合わせること
 NVS_OFFSET = 0x9000
-NVS_SIZE = 0x6000
+NVS_SIZE = 0x5000
 
 PAGE_SIZE = 4096
 ENTRY_SIZE = 32

@@ -12,6 +12,15 @@ constexpr float kDeg2Rad = kPi / 180.0F;
 
 } // namespace
 
+Vec3 stackChanFaceFrameFromCoreS3(Vec3 coreS3Vector) {
+  // CoreS3公式軸の X=画面右、Y=画面上、Z=画面表側を、方位計算が使う
+  // X=前、Y=右、Z=上へ並べ替える。
+  //
+  // Why not CoreS3のXを前として使う: Xはディスプレイの表ではなく右方向なので、
+  // 縦置きのスタックチャンでは画面が実際に見る方位と一致しない。
+  return Vec3{coreS3Vector.z, coreS3Vector.x, coreS3Vector.y};
+}
+
 float normalizeDegrees(float degrees) {
   float wrapped = std::fmod(degrees, 360.0F);
   if (wrapped < 0.0F) {
@@ -51,7 +60,7 @@ Vec3 horizontalMagneticComponents(Vec3 magneticField, Attitude attitude) {
 }
 
 float headingDegreesFromHorizontal(Vec3 horizontalMagneticField) {
-  return normalizeDegrees(std::atan2(-horizontalMagneticField.y, horizontalMagneticField.x) *
+  return normalizeDegrees(std::atan2(horizontalMagneticField.y, horizontalMagneticField.x) *
                           kRad2Deg);
 }
 
