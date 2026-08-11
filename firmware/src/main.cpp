@@ -23,6 +23,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -143,15 +144,21 @@ void syncTime() {
 }
 
 // サーボへ指令を出す。動作中の推定にも使う。
-void commandServo(int yawDeci, int pitchDeci) {
+void commandServo(int yawDeci, int pitchDeci, int actualYaw) {
+  // 同じ指令の繰り返しは弾く。ただし首が実際にそこにいる場合に限る。
+  //
+  // Why not 指令値の一致だけで判断する: 起動直後は g_commandedYaw が 0 で、
+  // 測定姿勢の指令 (yaw=0) と一致してしまう。すると move() が一度も呼ばれず、
+  // 首は電源投入時の角度に居座ったまま「正面にいるはず」と扱われる。
+  // 実機ではこれで ReturningToMeasurePose から抜けられなくなった。
+  const bool alreadyThere = std::abs(actualYaw - yawDeci) <= compass::kMeasurementYawToleranceDeci;
   const bool unchanged = yawDeci == g_commandedYaw && pitchDeci == g_commandedPitch;
-  if (unchanged) {
+  if (unchanged && alreadyThere) {
     return;
   }
   // 測定姿勢から離れるなら、溜めた方位を捨てる。首が動いた後に古い平均が
   // 残っていると、次に正面へ戻ったとき汚れた値が即座に採用されてしまう。
-  const bool leavingMeasurePose =
-      compass::isMeasurementPose(g_commandedYaw) && !compass::isMeasurementPose(yawDeci);
+  const bool leavingMeasurePose = !compass::isMeasurementPose(yawDeci);
   if (leavingMeasurePose) {
     g_headingFilter.reset();
     // 方位も無効に戻す。首が動いた後も古い値を「有効」と見なしていると、
@@ -170,6 +177,28 @@ bool servoLikelyMoving(std::uint32_t nowMillis) {
   return nowMillis - g_lastServoCommandMillis < g_config.servoSettleMillis;
 }
 
+// 測定姿勢の判定に使う首の角度。
+//
+// Why not g_commandedYaw: 指令値は「最後に move() を呼んだときの値」でしかない。
+// Tracking 中は deadband 内なら move() を呼ばないので、状態機械が正面を指示して
+// 首が実際に正面へ戻っていても、指令値は古い角度のまま取り残される。
+// その結果ゲートが NotMeasurementPose を返し続け、正しい測定を弾いてしまう
+// (実機で首が北を向かなかった原因)。実際の角度を読むのが唯一確実。
+//
+// ScsServo::getCurrentAngle() は実サーボへの UART 問い合わせでコストが高いので、
+// 毎周期ではなく間隔を空けて読む。
+int currentYawDeci(std::uint32_t nowMillis) {
+  static int cachedYaw = 0;
+  static std::uint32_t lastReadMillis = 0;
+  constexpr std::uint32_t kReadIntervalMillis = 200;
+
+  if (nowMillis - lastReadMillis >= kReadIntervalMillis) {
+    lastReadMillis = nowMillis;
+    cachedYaw = M5StackChan.Motion.getCurrentYawAngle();
+  }
+  return cachedYaw;
+}
+
 app::Input readInput() {
   if (M5StackChan.TouchSensor.wasSwipedForward()) {
     return app::Input::SwipeForward;
@@ -184,7 +213,9 @@ app::Input readInput() {
 }
 
 // 磁気を 1 サンプル取り込む。新しい値が来ていなければ何もしない。
-void updateHeading() {
+// yawDeci は loop() が読んだ実際の首の角度。ここで読み直すと UART を
+// 二重に叩くことになるので受け取る。
+void updateHeading(int yawDeci, std::uint32_t nowMillis) {
   if ((M5.Imu.update() & m5::IMU_Class::sensor_mask_mag) == 0) {
     return;
   }
@@ -199,8 +230,7 @@ void updateHeading() {
   // ゲートは「採用するか」を判断するだけで、フィルタの中身までは面倒を見ない。
   // 首を振っている間の値を溜め込むと、正面に戻った頃には平均が汚染されていて、
   // ゲートを通った瞬間に誤った方位を採用してしまう (実機で西を向く不具合の原因)。
-  const bool poseIsClean =
-      compass::isMeasurementPose(g_commandedYaw) && !servoLikelyMoving(millis());
+  const bool poseIsClean = compass::isMeasurementPose(yawDeci) && !servoLikelyMoving(nowMillis);
   if (!poseIsClean) {
     return;
   }
@@ -215,7 +245,7 @@ void updateHeading() {
 
 // 生の磁気・方位・指令を NVS に残す。ずれの原因 (軸か、偏角か、残差か) を
 // 切り分けるために、途中の値をすべて見えるようにしておく。
-void saveLiveState() {
+void saveLiveState(int actualYaw) {
   Preferences preferences;
   if (!preferences.begin(kDebugNamespace, false)) {
     return;
@@ -237,6 +267,10 @@ void saveLiveState() {
                      static_cast<int>(std::lround(g_headingFilter.valueDegrees() * 10.0F)));
   preferences.putInt("trueHdg", static_cast<int>(std::lround(g_bodyTrueHeading * 10.0F)));
   preferences.putInt("cmdYaw", g_commandedYaw);
+  // 指令値と実際の角度がずれていないかを見る。ゲートは指令値を信じて
+  // 「測定姿勢かどうか」を判断しているので、ここがずれていると前提が崩れる。
+  preferences.putInt("realYaw", actualYaw);
+  preferences.putInt("intentYaw", app::servoIntentFor(g_state).yawDeciDegrees);
   preferences.putInt("phase", static_cast<int>(g_state.phase));
   preferences.putInt("reject", static_cast<int>(g_state.lastReject));
   preferences.putInt("hdgOk", g_headingValid ? 1 : 0);
@@ -333,7 +367,10 @@ void loop() {
   M5StackChan.update();
   const std::uint32_t now = millis();
 
-  updateHeading();
+  // 実際の首の角度は 1 周期に 1 回だけ読む (UART 越しなのでコストが高い)
+  const int actualYaw = currentYawDeci(now);
+
+  updateHeading(actualYaw, now);
 
   // 8 の字回しの完了判定
   if (g_state.phase == app::Phase::Calibrating && g_collector.coverage() >= 1.0F) {
@@ -353,7 +390,7 @@ void loop() {
   gateInput.gyroMagnitudeDegPerSec = readGyroMagnitude();
   gateInput.fieldMagnitudeMicroTesla = compass::magnitude(readMag());
   gateInput.headingDispersionDegrees = g_headingFilter.dispersionDegrees();
-  gateInput.yawDeciDegrees = g_commandedYaw;
+  gateInput.yawDeciDegrees = actualYaw;
 
   if (!gateInput.servoMoving) {
     g_lastServoStopMillis = g_lastServoCommandMillis + g_config.servoSettleMillis;
@@ -385,9 +422,23 @@ void loop() {
 
   app::step(g_state, tick, g_config, g_observer);
 
+  // 局面が変わった瞬間だけ指令を出す。
+  //
+  // Why not 毎周期 commandServo() を呼ぶ: 同じ角度なら commandServo() 内で
+  // 早期リターンするとはいえ、局面が続く限り条件は成立し続ける。実機では
+  // これで UART が詰まってファームが応答しなくなった。
+  //
+  // Why not intent.shouldMove だけを見る: shouldMove は Tracking 中の
+  // 「天体が動いたぶんだけ追う」ための deadband 判定でしかない。測定のために
+  // 首を正面へ戻す局面でこれを尊重すると、指令が一度も出ないまま Measuring に
+  // 入り、首が前の角度に取り残されてゲートが弾き続ける (実機で発生)。
+  static app::Phase lastPhase = app::Phase::Error;
+  const bool phaseChanged = g_state.phase != lastPhase;
+  lastPhase = g_state.phase;
+
   const app::ServoIntent intent = app::servoIntentFor(g_state);
-  if (intent.shouldMove) {
-    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees);
+  if (intent.shouldMove || phaseChanged) {
+    commandServo(intent.yawDeciDegrees, intent.pitchDeciDegrees, actualYaw);
   }
 
   static std::uint32_t lastDraw = 0;
@@ -400,7 +451,7 @@ void loop() {
   static std::uint32_t lastDebugSave = 0;
   if (now - lastDebugSave >= 3000) {
     lastDebugSave = now;
-    saveLiveState();
+    saveLiveState(actualYaw);
   }
 
   delay(10);

@@ -58,6 +58,13 @@ if(BUILD_TESTING)
     add_test(NAME ${suite}-test COMMAND ${suite}-test)
   endforeach()
 
+  # ファームの loop() が方位を確定させる経路をホストで再現する
+  add_executable(heading-pipeline-test test/heading_pipeline_test.cpp)
+  target_link_libraries(heading-pipeline-test PRIVATE app_core)
+  target_include_directories(heading-pipeline-test PRIVATE test)
+  target_compile_options(heading-pipeline-test PRIVATE ${COMPASS_WARNINGS})
+  add_test(NAME heading-pipeline-test COMMAND heading-pipeline-test)
+
   add_executable(app-test test/app_test.cpp)
   target_link_libraries(app-test PRIVATE app_core)
   target_include_directories(app-test PRIVATE test)
